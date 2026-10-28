@@ -8934,10 +8934,6 @@ bool BbscApplyDeathPenalty(std::string_view why) {
              GetLocalPlayerType(), gate);
     BBSC_TIMELINE("DEATH", "death penalty ({}): dropped {} echoes (now {}, stain holds {} in map {:#x}, type {}, gate {})",
              why, before, GetBloodEchoes(), in_stain, stain_map, GetLocalPlayerType(), gate);
-             "BBSC death penalty ({}): dropped {} echoes (now {}, stain holds {}, type {}, gate {})",
-             why, before, GetBloodEchoes(), in_stain, GetLocalPlayerType(), gate);
-    BBSC_TIMELINE("DEATH", "death penalty ({}): dropped {} echoes (now {}, stain holds {}, type {}, gate {})",
-             why, before, GetBloodEchoes(), in_stain, GetLocalPlayerType(), gate);
     if (use_spot) {
         CorrectBbscStainRecord(spot, why);
     }
