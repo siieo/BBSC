@@ -9186,6 +9186,15 @@ void PS4_SYSV_ABI BbscBossClearHook(u64 tag, const GuestRegisterSnapshot* regist
                                                    now - bbsc_boss_bar_seen_ms <= BbscBossClearFightMs);
         if (LocalPlayerType() == 1 && !own_bar) {
             bbsc_boss_clear_skip = 1;
+            // Integration (pr/9 + pr/14): a guest can be spectating on the HOST's boss bar alone
+            // (BbscBossFightAtDeath). With BlockClear2 skipped here, BlockClear2_1 (tag 0) never
+            // runs on it, so nothing would set bbsc_boss_killed_ms and TickBbscSpectate's "boss
+            // killed" release would never come. The host's kill still ends that spectate.
+            if (bbsc_spectate_active && BbscHostBossFightRecent(BbscBossClearFightMs)) {
+                bbsc_boss_killed_ms = now;
+                LOG_INFO(Debug, "BBSC boss clear: the spectating guest is released on the host's "
+                                "kill (no own boss bar)");
+            }
             LOG_INFO(Debug, "BBSC boss clear: BlockClear2 on the guest without its own boss bar in "
                             "the last {} s (a boss flag from the host's world?) - skipped (host's "
                             "bar {})",
