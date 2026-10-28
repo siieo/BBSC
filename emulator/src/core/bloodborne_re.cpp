@@ -9109,6 +9109,8 @@ u8 bbsc_boss_home_skip = 0;
 constexpr s64 BbscBossUnlockMs = 20'000;
 s64 bbsc_boss_unlock_until_ms = 0;
 s64 bbsc_gate_watch_since_ms = 0; // the guest's last boss clear, see TickBbscGateWatch
+// Set by BlockClear2_1 on a guest, cleared when the session ends; see TickBbscBossLeaveMark.
+bool bbsc_boss_guest_kept = false;
 
 bool BbscSessionAlive() {
     const s32 state = GetSessionState();
@@ -9208,6 +9210,7 @@ void PS4_SYSV_ABI BbscBossClearHook(u64 tag, const GuestRegisterSnapshot* regist
         bbsc_boss_killed_ms = SteadyNowMs();
         if (LocalPlayerType() == 1) {
             bbsc_gate_watch_since_ms = bbsc_boss_killed_ms;
+            bbsc_boss_guest_kept = true;
         }
         ArmBbscDeathLockClear();
         if (LocalPlayerType() == 1) {
@@ -9401,6 +9404,57 @@ void BbscLeaveItemUsed(std::string_view event) {
     }
 }
 
+
+// A guest's own "leaving" mark after a boss kill. BlockClear2_2 (0x01385760) starts custom call 4063
+// with the local player id, and OnGameLeave then calls ReqularLeavePlayer (0x01337500), which sets
+// our slot's byte [0x0553B130]+0xA9+slot*2: the state of a phantom on its way home. The death-lock
+// clearing only covers 15 s after the kill, and the guest could not pick up items or use ladders and
+// doors after it (test 2026-10-19). While a guest stays in the session after a boss, its own mark
+// is cleared here, unless it is really leaving (Silencing Blank, quit to the title).
+constexpr s64 BbscDeliberateLeaveMs = 60'000;
+
+void TickBbscBossLeaveMark() {
+    static s64 last_ms = 0;
+    const s64 now = SteadyNowMs();
+    if (!bbsc_boss_guest_kept || image_base == 0 || now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    if (GetSessionState() != 6) {
+        bbsc_boss_guest_kept = false;
+        return;
+    }
+    if (bbsc_persistence_restore_at_ms != 0 ||
+        (bbsc_leave_event_ms.load() != 0 && now - bbsc_leave_event_ms.load() < BbscDeliberateLeaveMs)) {
+        return;
+    }
+    const u64 global = GetGlobalState();
+    const u64 player = GetLocalPlayerCharacter();
+    if (!ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0 || player == 0 ||
+        GetCharacterHp(player) <= 0) {
+        return;
+    }
+    const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+    if (!ReadablePointer(slots, 0xB0) || !HasMemoryAccess(slots + 0xA9, 8, MemoryProt::CpuWrite)) {
+        return;
+    }
+    const u64 own = ReadValue<u64>(slots, 0x08);
+    const u64 records = ReadValue<u64>(slots, 0x10);
+    if (!ReadablePointer(own, 0x14) || !ReadablePointer(records, 0x10 + 4 * 0x6A0)) {
+        return;
+    }
+    const s32 own_id = ReadValue<s32>(own, 0x10);
+    for (u32 slot = 0; slot < 4; ++slot) {
+        if (own_id != -1 && ReadValue<s32>(records, 0x10 + slot * 0x6A0) == own_id &&
+            ReadValue<u8>(slots, 0xA9 + slot * 2) != 0) {
+            WriteValue<u8>(slots, 0xA9 + slot * 2, 0);
+            LOG_INFO(Debug,
+                     "BBSC boss clear: our own slot {} was marked leaving (OnGameLeave) - cleared, "
+                     "the guest stays and can act",
+                     slot);
+        }
+    }
+}
 
 // Any player character in WorldChrMan that is not the local one, alive or dead.
 int RemotePlayerCount() {
@@ -16871,6 +16925,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscStageWatch();
         TickBbscHostDeathNotice();
         TickBbscBossUnlock();
+        TickBbscBossLeaveMark();
         TickBbscWipeEchoes();
         TickBbscStaleBossBar();
         TickBbscBossClearProbe();
