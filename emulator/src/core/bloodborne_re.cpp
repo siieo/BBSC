@@ -10597,8 +10597,10 @@ struct BbscBossExitWall {
     u32 object;
     u32 fog;
     u32 boss_flag;
+    u32 map; // the packed map the wall lives in; the tick only acts while that map is resident
 };
-constexpr std::array<BbscBossExitWall, 1> BbscBossExitWalls{{{13400010, 3401801, 3403801, 9471}}};
+constexpr std::array<BbscBossExitWall, 1> BbscBossExitWalls{
+    {{13400010, 3401801, 3403801, 9471, 0x34000000}}};
 constexpr u64 ObjectSfxDeleteOffset = 0x01315E50; // (_, entity_id, now), what 2006[1] calls
 
 u8 bbsc_wall_draw_skip = 0;
@@ -10824,7 +10826,10 @@ void TickBbscBossExitWalls() {
     using SfxDelete = u64 PS4_SYSV_ABI (*)(u64 unused, u32 entity_id, u32 now);
     for (size_t k = 0; k < BbscBossExitWalls.size(); ++k) {
         const BbscBossExitWall& wall = BbscBossExitWalls[k];
-        if (hidden[k] || !BbscEventFlag(wall.boss_flag)) {
+        // Integration: only in the wall's own map - once the boss flag is set, this tick would
+        // otherwise call the object switches for an entity that exists nowhere else, after every
+        // load in every map.
+        if (hidden[k] || !BbscMapResident(wall.map) || !BbscEventFlag(wall.boss_flag)) {
             continue;
         }
         hidden[k] = true;
@@ -16192,23 +16197,38 @@ void TickBbscGuestBlank() {
 // Broadcast) and only goes quiet during its own loads. A living guest that has heard nothing from
 // its host for BbscHostGoneMs leaves the way a Parting Blank does (OnLeaveMagic, as
 // TickBbscGuestBlank) and goes home. A crash on the host's side ends the same way.
-constexpr s64 BbscHostGoneMs = 45'000;
+// Integration: 90 s rather than 45 s - the host is silent through every load of its own
+// (TickBbscFollowBroadcast returns while global+0x08 is set), and a host death plus a long
+// reload came close to 45 s.
+constexpr s64 BbscHostGoneMs = 90'000;
 
 void TickBbscHostGone() {
     static s64 left_ms = 0;
+    static s64 guest_since_ms = 0; // when this guest session (state 6) began
     const s64 now = SteadyNowMs();
     if (image_base == 0 || GetSessionState() != 6 || GetLocalPlayerType() != 1 ||
         !BbscWarpTogetherEnabled()) {
         left_ms = 0;
+        guest_since_ms = 0;
         return;
+    }
+    if (guest_since_ms == 0) {
+        guest_since_ms = now;
     }
     s64 heard_ms = 0;
     {
         std::scoped_lock lock{bbsc_follow_mutex};
         heard_ms = bbsc_follow_latest.received_ms;
     }
-    if (heard_ms == 0 || now - heard_ms < BbscHostGoneMs) {
+    // Integration: bbsc_follow_latest is never reset between sessions, so a packet from an earlier
+    // host must not count - only one received in this session, and only once the session itself is
+    // older than the timeout.
+    if (heard_ms == 0 || heard_ms < guest_since_ms || now - guest_since_ms < BbscHostGoneMs ||
+        now - heard_ms < BbscHostGoneMs) {
         return; // never heard from this host (older build?), or it is still there
+    }
+    if (RemotePlayerCount() != 0) {
+        return; // the host's copy is still in the world: silent, but not gone
     }
     if (left_ms != 0 && now - left_ms < 15'000) {
         return; // asked already, the leave is under way
