@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026-10-28 - PR integration on top of 0.0.2 (fixes only)
+
+Pull requests applied (see INTEGRATION-NOTES.md at the repository root for the full list, the
+ones left out, and the hand edits):
+- Wipe / boss deaths: #9 (wipe reload goes to the host, guest echoes return with the host's
+  bloodstain, one wipe reload per repeat death, stale boss bar after a load), #14 (no boss clear on
+  a guest without its own boss bar; timed effects, poison and SpEffect 2 taken off at a revive in
+  place), #10 (guest's own "leaving" slot mark cleared after a boss kill), #22 (respawn beside the
+  survivor, fall guard after a far-lamp respawn or a join), #39 (join stays black until placed).
+- Guest world: #23 (host draws a re-inserted guest that came back invisible), #24 (one reload when
+  the Dream flags differed a lot at a summon), #27 (one reload into a host map that never got the
+  host's flags), #31 (bloodstain where the guest really died), #42 (Ludwig's exit wall opens in a
+  session once he is dead - only while m34 is resident), #28 (guest goes home when the host has
+  been silent - 90 s, per session, and only with no host copy in the world).
+- From #38, two standalone fixes: no phantom type left at home after a crashed respawn load; the
+  guest gets up after the wipe reload without waiting for the host's copy.
+- Kit / messages / network: #19 (Kin and Bloodlust Bell take the Resonant/Sinister branch - the
+  Kin Bell was greyed out after a boss), #21 (leave/session texts instead of "?ActionEventInfo?"),
+  #13 (the host's game reaches its own server over 127.0.0.1), #29 (free camera reads the
+  controller through SDL3/XInput and hides the pad from the game while on - BBport).
+- Left out: #4 (Linux port, conflicts in every mod file), #12 (THD messages, feature), #20 (log
+  upload, server half does not run on 0.0.2), #26 (Communion Chalice, feature), #38 (revive
+  feature), #33 (superseded by #39), #17 (superseded by #9), #25 and #11 (already on 0.0.2 by other
+  code), #32 (contradicts the 2026-10-19 "back home where we were" rule), and the logging-only
+  commits of #19 and #21.
+- Nothing here was run in the game: bloodborne_re.cpp passes a syntax-only compile in both the
+  emulator and the mod (BBSC_MOD) flavours; the mod DLL files (#13, #29) were reviewed, not built.
+
 ## 2026-10-04 (c) - mod 11: Silencing Blank ends the co-op cleanly; Memory Altar for the guest
 
 - New tool: tools\gamedata\lua50.py - reads the game's compiled Lua (Lua 5.0 with one extra empty list

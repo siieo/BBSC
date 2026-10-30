@@ -1,0 +1,40 @@
+# Builds the BBSC mod (bbsc.dll + bbsc-launch.exe) on a Windows runner. The same two files work
+# for shadPS4 and for BBport (bbsc-launch.exe stands in for bb-probe.exe and injects bbsc.dll).
+# Run it from the Actions tab ("Run workflow"); the result is the "bbsc-mod" artifact.
+name: Build BBSC mod
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "emulator/mod/**"
+      - "emulator/src/core/**"
+      - ".github/workflows/build-mod.yml"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the two header libraries the mod uses
+        run: git submodule update --init --depth 1 emulator/externals/fmt emulator/externals/xbyak
+
+      - name: Build bbsc.dll and bbsc-launch.exe
+        shell: cmd
+        env:
+          BBSC_OUT: ${{ github.workspace }}\build\mod
+        run: |
+          call emulator\mod\build-mod.cmd
+          if errorlevel 1 (
+            type build\mod-build.log
+            exit /b 1
+          )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bbsc-mod
+          path: |
+            build/mod/bbsc.dll
+            build/mod/bbsc-launch.exe
+            build/mod-build.log
