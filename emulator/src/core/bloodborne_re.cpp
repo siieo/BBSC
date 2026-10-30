@@ -309,7 +309,8 @@ constexpr auto Sites = std::to_array<TraceSite>({
     {"OnSummonResult.TimeOut", 0x01384520, TraceKind::MatchingSignal, ReturnAndPadding, 16},
     {"OnSummonResult.OtherError", 0x01384530, TraceKind::MatchingEvent, StandardRbxPrologue, 5},
     {"ForceSummonFail", 0x01384990, TraceKind::MatchingSignal, ReturnAndPadding, 16},
-    {"ForceSummonSuccess", 0x013849A0, TraceKind::MatchingEvent, StandardR15Prologue, 6},
+    // 0x013849A0 was traced here as "ForceSummonSuccess", but the game registers it as BlockClear2
+    // (ForceSummonSuccess is 0x01384990); its entry is BBSC's BlockClear2 hook now.
 
     {"CSMultiPlayMan.StageUidChanged.Policy",
      MultiPlayStageUidPolicyOffset,
@@ -561,11 +562,9 @@ constexpr auto Sites = std::to_array<TraceSite>({
      TraceKind::BellAvailability,
      {0x89, 0x85, 0x10, 0xFE, 0xFF, 0xFF},
      6},
-    {"ResponderBell.Availability.Entry",
-     0x0157F686,
-     TraceKind::ResponderBellAvailability,
-     {0x41, 0x81, 0xFC, 0xCD, 0x00, 0x00, 0x00},
-     7},
+    // ResponderBell.Availability.Entry (0x0157F686) is gone: KitBells.KinBellChecks patches the
+    // compare's immediate there, and the mod rewrites patch sites that change, which would break a
+    // hook's jump over it. FinalResult below still logs every bell check's result.
     {"ResponderBell.Availability.FinalResult",
      0x015800D1,
      TraceKind::ResponderBellAvailability,
@@ -3288,6 +3287,9 @@ void EndBbscLoadCover(std::string_view how);
 // The host's world state for a follow load, see "World state when warping together".
 bool BbscHostWorldFlagsReady(u32 packed_map);
 bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why);
+// The map blocks given the host's flags since the last load (ApplyBbscHostWorldFlags), see
+// "A map the host's flags never reached".
+std::vector<u32> bbsc_world_written_maps;
 void LogBbscHostWorldFlagsDiff(u32 packed_map, std::string_view why);
 void ApplyBbscGuestLootView(u32 packed_map, std::string_view why); // see "Guest loot view"
 void KeepBbscOwnWorldGroup(u32 key, const u8* live); // see "Own world journal"
@@ -3493,6 +3495,7 @@ bool BbscRejoinV7Enabled() {
 //   WorldChrMan       [0x0553E878]+0x30 count, +0x38 entries (0x38 each, +0 PlayerIns*),
 //                     PlayerIns+0x3D8 member id. Member-id compare = 0x00CA1C70.
 constexpr u64 PlayerSlotManagerPointerOffset = 0x0553B130;
+s64 bbsc_reinsert_ms = 0; // last re-insert of a remote player, see TickBbscReinsertVisible
 constexpr u64 MultiPlayManPointerOffset = 0x05540230;
 constexpr u64 MultiPlayerInsSetStateOffset = 0x01E52560;
 // Ghidra name FUN_01ca1c70 = offset 0x00CA1C70 (Ghidra base 0x01000000). 0x01CA1C70 is mid-function.
@@ -3837,7 +3840,66 @@ void TickBbscReinsertV8() {
     }
     LOG_INFO(Debug, "BBSC reinsert v8: restarted {} remote player insert task(s) at FirstSyncWait",
              restarted);
+    if (restarted != 0) {
+        bbsc_reinsert_ms = SteadyNowMs();
+    }
     LogBbscSessionShape("v8 restarted", true);
+}
+
+// A phantom at home (2026-10-24 20:10, the user: "can't ring on guest"): the kept death sets the
+// own-world restore type to the phantom's (see SetOwnWorldRestoreType) and TickBbscReinsertV8
+// puts it back once the respawn is done or times out - both on this game thread. The host crashed
+// in that respawn's load and the guest's game froze there (20:05:46, log ends), so it was never
+// put back, the save kept it, and the next start built the guest as type 1 in its own world:
+// slot and character type 1, own world 1, session state 0 - and the bells refused it ("not for
+// this player type"). At home, not loading, with no kept death pending, any phantom type left on
+// the restore record, the slot (+0xA4) or the live character (+0x78) is set back to 0, once.
+bool BbscIsPhantomType(s32 type) {
+    return type == 1 || type == 2 || type == 12 || type == 13;
+}
+
+void TickBbscHomeTypeRepair() {
+    static s64 last_ms = 0;
+    const s64 now = SteadyNowMs();
+    if (now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    const u64 global = GetGlobalState();
+    if (bbsc_v8_pending || GetSessionState() != 0 || !ReadablePointer(global, 0x1593) ||
+        ReadValue<u8>(global, 0x1592) != 1 || ReadValue<u8>(global, 0x08) != 0 ||
+        GetBbscLocalPlayerHp() <= 0) {
+        return;
+    }
+    const u64 record = ReadValue<u64>(image_base + 0x0553B188, 0);
+    const s32 restore = ReadablePointer(record, 0x08) ? ReadValue<s32>(record, 4) : -1;
+    const s32 slot_type = GetLocalPlayerType();
+    const s32 chr_type = GetLocalCharacterType();
+    if (!BbscIsPhantomType(restore) && !BbscIsPhantomType(slot_type) &&
+        !BbscIsPhantomType(chr_type)) {
+        return;
+    }
+    if (BbscIsPhantomType(restore)) {
+        SetOwnWorldRestoreType(0, nullptr);
+    }
+    const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+    const u64 local = ReadablePointer(slots, 0x10) ? ReadValue<u64>(slots, 0x08) : 0;
+    if (BbscIsPhantomType(slot_type) && ReadablePointer(local, 0xA8) &&
+        HasMemoryAccess(local + 0xA4, 4, MemoryProt::CpuWrite)) {
+        WriteValue<s32>(local, 0xA4, 0);
+    }
+    const u64 world_chr = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+    const u64 player = ReadablePointer(world_chr, 0x68) ? ReadValue<u64>(world_chr, 0x60) : 0;
+    if (BbscIsPhantomType(chr_type) && ReadablePointer(player, 0x80) &&
+        HasMemoryAccess(player + 0x78, 4, MemoryProt::CpuWrite)) {
+        WriteValue<s32>(player, 0x78, 0);
+    }
+    LOG_WARNING(Debug, "BBSC home type: a phantom's type at home (restore {}, slot {}, character {}) "
+                       "- set back to 0",
+                restore, slot_type, chr_type);
+    BBSC_TIMELINE("SESSION", "home type: a phantom's type at home (restore {}, slot {}, character {}) "
+                             "- set back to 0",
+                  restore, slot_type, chr_type);
 }
 
 // Self-heal (host and guest): a member task that reached CreateWait (6) but whose character is gone
@@ -3985,6 +4047,11 @@ constexpr s64 BbscWipeHostSettleMs = 2'000; // let the host's synced position se
 // while the guest was down saw a wipe and a reload, even if it never saw "nobody alive" itself
 // (test 2026-10-06: the guest died while the dead host was already reloading).
 u32 bbsc_spectate_revivals_at_death = 0;
+// bbsc_peer_revivals when the local player went down, saved by TickBbscLifeBroadcast. The death step
+// can reach the hook several seconds later; if the host reloaded in that gap, a count taken in the
+// hook already includes it and the guest misses the wipe (test 2026-10-19).
+u32 bbsc_revivals_at_own_down = 0;
+bool bbsc_own_down = false;
 
 bool BbscSpectateEnabled() {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_SPECTATE");
@@ -4198,8 +4265,17 @@ void NoteBbscBossBar() {
 
 // A boss fight was on when the player died: a bar is up now, or was up moments ago and no boss
 // has been killed since.
+bool BbscHostBossBarRecent(s64 within_ms); // see "Boss name line"
+constexpr s64 BbscHostBossAtDeathMs = 5'000;
+
 bool BbscBossFightAtDeath() {
     if (BossFightActive()) {
+        return true;
+    }
+    // A guest also counts the host's boss bar (sent every second): on 2026-10-20 at Darkbeast Paarl
+    // the guest died twice in the fight and was revived within seconds each time, as if no boss
+    // fight was on, instead of spectating until the kill.
+    if (GetSessionState() == 6 && BbscHostBossBarRecent(BbscHostBossAtDeathMs)) {
         return true;
     }
     return bbsc_boss_bar_seen_ms != 0 && bbsc_boss_killed_ms < bbsc_boss_bar_seen_ms &&
@@ -4551,6 +4627,8 @@ bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std
     return true;
 }
 
+void ArmBbscJoinFallGuard(const BbscTransform& spot); // see "Fall guard after a far lamp"
+
 void TickBbscJoinTeleport() {
     static bool done = false;
     static bool warp_requested = false;
@@ -4675,6 +4753,10 @@ void TickBbscJoinTeleport() {
              "({:.2f}, {:.2f}, {:.2f})",
              own ? own->position[0] : 0.0f, own ? own->position[1] : 0.0f,
              own ? own->position[2] : 0.0f, position[0], position[1], position[2]);
+    BbscTransform spot{};
+    spot.position = position;
+    spot.rotation = rotation;
+    ArmBbscJoinFallGuard(spot); // see "Fall guard after a far lamp"
     EndBbscLoadCover("guest placed beside the host");
 }
 
@@ -4991,7 +5073,19 @@ void TickBbscFollowHost() {
     // The host's map when both were last in the same one: a different map later means the HOST
     // went somewhere. If only the guest walked off, the host's map is still this one.
     static u32 shared_host_map = 0;
-    if (!IsUsablePackedMap(here) || here == host.packed_map) {
+    // A map the host's flags never reached (2026-10-21 00:12, guest log): the guest walked from
+    // the host's area into Central Yharnam with no load, and the host came after. The flags are
+    // written at a load, for the map and the rest of its area, so that map was still the guest's
+    // own world: the clinic door and the Oedon gate shut that the host had opened, and the
+    // area's boss events ran a "Prey Slaughtered" on the guest with no boss anywhere. Writing the
+    // flags now would not open a door that is already built, so the guest reloads once into the
+    // host's spot with the host's flags, as a follow does. Not in a boss fight, not in the Dream
+    // (it has its own state).
+    const bool catch_up =
+        IsUsablePackedMap(here) && here == host.packed_map && here != BbscDreamStateMap &&
+        std::ranges::find(bbsc_world_written_maps, here) == bbsc_world_written_maps.end() &&
+        BbscHostWorldFlagsReady(here) && !BossFightActive();
+    if (!IsUsablePackedMap(here) || (here == host.packed_map && !catch_up)) {
         mismatch_since_ms = 0;
         shared_host_map = host.packed_map;
         return; // same map as the host: nothing to follow
@@ -5010,7 +5104,7 @@ void TickBbscFollowHost() {
     // host who changed map since they last shared one.
     const bool host_moved = shared_host_map != 0 && host.packed_map != shared_host_map;
     const bool same_area = (here >> 24) == (host.packed_map >> 24);
-    if (!host_loaded_there && (same_area || !host_moved)) {
+    if (!catch_up && !host_loaded_there && (same_area || !host_moved)) {
         static u32 apart_logged = 0;
         if (apart_logged != (here ^ host.packed_map)) {
             apart_logged = here ^ host.packed_map;
@@ -5022,7 +5116,7 @@ void TickBbscFollowHost() {
         mismatch_since_ms = 0;
         return;
     }
-    if (!host_loaded_there && BbscMapResident(host.packed_map)) {
+    if (!catch_up && !host_loaded_there && BbscMapResident(host.packed_map)) {
         static u32 walk_logged = 0;
         if (walk_logged != host.packed_map) {
             walk_logged = host.packed_map;
@@ -5088,11 +5182,20 @@ void TickBbscFollowHost() {
     }
     world_wait_map = 0;
     ++attempts;
-    LOG_INFO(Debug,
-             "BBSC warp together: host moved to map {:#x} (we are in {:#x}), following "
-             "(attempt {} of {}; {}; maps loaded here: {})",
-             host.packed_map, here, attempts, BbscFollowMaxAttempts,
-             host_loaded_there ? "host arrived by a load" : "host walked", BbscResidentMapsText());
+    if (catch_up) {
+        LOG_INFO(Debug,
+                 "BBSC warp together: we are in the host's map {:#x}, but it was never loaded with "
+                 "the host's flags (we walked in) - one reload into the host's world (attempt {} "
+                 "of {})",
+                 here, attempts, BbscFollowMaxAttempts);
+    } else {
+        LOG_INFO(Debug,
+                 "BBSC warp together: host moved to map {:#x} (we are in {:#x}), following "
+                 "(attempt {} of {}; {}; maps loaded here: {})",
+                 host.packed_map, here, attempts, BbscFollowMaxAttempts,
+                 host_loaded_there ? "host arrived by a load" : "host walked",
+                 BbscResidentMapsText());
+    }
     BBSC_TIMELINE("FOLLOW", "warp together: host moved to map {:#x} (we are in {:#x}), following "
              "(attempt {} of {}; {}; maps loaded here: {})",
              host.packed_map, here, attempts, BbscFollowMaxAttempts,
@@ -5531,6 +5634,10 @@ bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why) {
     size_t changed_bytes = 0;
     size_t missing = 0;
     const size_t written = write_block(host, changed_bytes, missing);
+    if (written != 0 && std::ranges::find(bbsc_world_written_maps, packed_map) ==
+                            bbsc_world_written_maps.end()) {
+        bbsc_world_written_maps.push_back(packed_map);
+    }
     LOG_INFO(Debug,
              "BBSC world state ({}): host's flags for map {:#x} written ({} groups, {} bytes "
              "differed, {} groups missing here, snapshot {} is {} ms old)",
@@ -5566,6 +5673,10 @@ bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why) {
         size_t other_changed = 0;
         size_t other_missing = 0;
         const size_t n = write_block(snap, other_changed, other_missing);
+        if (n != 0 && std::ranges::find(bbsc_world_written_maps, snap.map) ==
+                          bbsc_world_written_maps.end()) {
+            bbsc_world_written_maps.push_back(snap.map);
+        }
         if (BbscMapArea(snap.map) == BbscMapArea(packed_map)) {
             LOG_INFO(Debug,
                      "BBSC world state ({}): host's flags for the neighbouring block {:#x} written "
@@ -5710,6 +5821,7 @@ bool BbscHostDreamStateReady() {
            SteadyNowMs() - bbsc_dream_ready.complete_ms < BbscWorldFlagsFreshMs;
 }
 
+constexpr size_t BbscJoinRebuildBytes = 64; // see the end of ApplyBbscHostDreamState
 // Guest side: the host's Dream state into our live table (see "The host's Hunter's Dream").
 void ApplyBbscHostDreamState(std::string_view why) {
     if (!BbscWorldSyncEnabled() || !BbscDreamEnabled() || image_base == 0) {
@@ -5762,6 +5874,18 @@ void ApplyBbscHostDreamState(std::string_view why) {
              "differed from ours (snapshot {} ms old); shops keep our own unlocks and stock ({} "
              "flags differed from the host's)",
              why, written, changed_bytes, SteadyNowMs() - host.complete_ms, shop_bits);
+    // A summon into the host's Dream: its load starts before the host's Dream state arrives, so
+    // the Dream was built with our own flags and these were written after. Many differing bytes
+    // can switch map parts under the guest (2026-10-20 16:03: 336 bytes, the guest fell through
+    // the floor twice; the follow loads, written before the load, had 8 to 10). The join then
+    // reloads once like a cross-map join, so the Dream is rebuilt with the host's flags.
+    if (why == "load created the character" && changed_bytes > BbscJoinRebuildBytes &&
+        GetSessionState() == 6 && !bbsc_join_teleport_done) {
+        bbsc_cross_map_join.store(true, std::memory_order_release);
+        LOG_INFO(Debug, "BBSC Dream state: {} bytes differed at the join load - the join reloads "
+                        "once so the Dream is built with the host's flags",
+                 changed_bytes);
+    }
 }
 
 // Guest side: our own Dream groups back, keeping whatever the game changed since we wrote.
@@ -5840,6 +5964,7 @@ void ApplyBbscHostWorldFlagsAtLoad() {
         return;
     }
     LogBbscHostWorldFlagsDiff(map, "load created the character, before writing");
+    bbsc_world_written_maps.clear(); // a new load: only what is written now counts
     ApplyBbscHostWorldFlags(map, "load created the character");
     ApplyBbscHostTime("load created the character");
     if (map == BbscDreamStateMap) {
@@ -6956,6 +7081,7 @@ struct BbscCurtainState {
 };
 BbscCurtainState bbsc_curtain;
 bool BbscRespawnInPlace(std::string_view why); // below
+size_t BbscCureStatusAfterRevive(std::string* ids = nullptr); // see "The X lock after a revive in place"
 void BbscRestockFromStorage(std::string_view why); // below
 s64 bbsc_inplace_respawn_ms = 0; // last BbscRespawnInPlace revive
 
@@ -6964,10 +7090,20 @@ bool BbscCurtainActive() {
 }
 
 // The respawn lines wait for the screen to come back.
+// A notice due while the load cover is up waits for it (see EndBbscLoadCover).
+bool BbscLoadCoverActive();
+const char16_t* bbsc_cover_notice = nullptr;
+std::string_view bbsc_cover_notice_what;
+
 void BbscAnnounceAfterCurtain(const char16_t* text, std::string_view what) {
     if (BbscCurtainActive()) {
         bbsc_curtain.notice = text;
         bbsc_curtain.notice_what = what;
+        return;
+    }
+    if (BbscLoadCoverActive()) {
+        bbsc_cover_notice = text;
+        bbsc_cover_notice_what = what;
         return;
     }
     BbscAnnounce(text, what);
@@ -7090,6 +7226,7 @@ struct BbscLoadCoverState {
     bool own_screen = false;       // BBSC opened the loading screen (between / after the loads)
     s64 started_ms = 0;
     s64 load_over_ms = 0;          // the game's loading screen closed and no load is running
+    s64 real_load_over_ms = 0;     // no load running (global+8), whatever the loading screen says
     s64 no_session_since_ms = 0;
     std::string why;
 };
@@ -7114,11 +7251,19 @@ void StartBbscLoadCover(std::string_view why) {
     BBSC_TIMELINE("LOAD", "load cover: fading out ({})", why);
 }
 
+bool BbscLoadCoverActive() {
+    return bbsc_load_cover.active;
+}
+
 void EndBbscLoadCover(std::string_view how) {
     if (!bbsc_load_cover.active) {
         return;
     }
     bbsc_load_cover.active = false;
+    if (bbsc_cover_notice != nullptr) {
+        BbscAnnounce(bbsc_cover_notice, bbsc_cover_notice_what);
+        bbsc_cover_notice = nullptr;
+    }
     if (bbsc_load_cover.why == "summon") {
         bbsc_join_quiet_until_ms = SteadyNowMs() + 8'000; // the join banner filter (BbscJoinQuiet)
     }
@@ -7158,12 +7303,30 @@ void TickBbscLoadCover() {
     // map, so no follow load ran - and only the follow's arrival ended the cover. The loading screen
     // stayed up 75 s ("infinite loading screen unless you teleport"). A wipe cover ends once its
     // load is over and the respawn after it is done (curtain closed, alive), or 20 s after the load.
+    // Test 2026-10-21 01:04 (guest): the wipe reload was over and the guest revived at the host's
+    // lamp, but the loading screen's state stayed up after the death curtain had forced it closed,
+    // so this waited on it until the session ended 50 s later ("stuck on the Bloodborne screen").
+    // The loading screen only counts for 8 s after the real load is over; then it is closed here.
     if (bbsc_load_cover.why == "wipe" && bbsc_load_cover.game_screen_seen) {
         const u64 global = GetGlobalState();
         const u64 menu = ReadValue<u64>(image_base + MenuManPointerOffset, 0);
-        const bool loading = (ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0) ||
-                             (ReadablePointer(menu, 0x810) && ReadValue<s32>(menu, 0x804) != 0 &&
-                              !bbsc_load_cover.own_screen);
+        const bool real_load = ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0;
+        const bool menu_screen = ReadablePointer(menu, 0x810) && ReadValue<s32>(menu, 0x804) != 0 &&
+                                 !bbsc_load_cover.own_screen;
+        if (real_load) {
+            bbsc_load_cover.real_load_over_ms = 0;
+        } else if (bbsc_load_cover.real_load_over_ms == 0) {
+            bbsc_load_cover.real_load_over_ms = now;
+        }
+        const bool screen_stuck = menu_screen && bbsc_load_cover.real_load_over_ms != 0 &&
+                                  now - bbsc_load_cover.real_load_over_ms >= 8'000;
+        if (screen_stuck && !bbsc_load_cover.own_screen) {
+            LOG_INFO(Debug, "BBSC load cover: no load for 8 s but the loading screen is still up "
+                            "(state {}) - closing it with the cover",
+                     ReadValue<s32>(menu, 0x804));
+            bbsc_load_cover.own_screen = true; // EndBbscLoadCover closes it
+        }
+        const bool loading = real_load || (menu_screen && !screen_stuck);
         if (loading) {
             bbsc_load_cover.load_over_ms = 0;
         } else if (bbsc_load_cover.load_over_ms == 0) {
@@ -7193,9 +7356,18 @@ void TickBbscLoadCover() {
                 LOG_INFO(Debug, "BBSC load cover: the game's loading screen is up (kind {})",
                          ReadValue<s32>(menu, 0x808));
             }
-            return;
-        }
-        if (!bbsc_load_cover.game_screen_seen) {
+            // 2026-10-24 (the user: "you see your character and then you are teleported"): the
+            // summon load was over 3 s before the guest was placed (20:55:16.6 the load made the
+            // character, 20:55:19.5 the join teleport), and in that time the game's loading screen
+            // was closing - MenuMan+0x804 still set, so the cover kept off it, and "loading screen
+            // kept up" was never logged in any join that day. Once no load runs, the plate goes
+            // black under it too, until the guest is placed. A wipe's cover keeps its own rules.
+            const u64 global = GetGlobalState();
+            const bool real_load = ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0;
+            if (real_load || bbsc_load_cover.why == "wipe") {
+                return; // the game's logo while the load runs
+            }
+        } else if (!bbsc_load_cover.game_screen_seen) {
             WriteValue<s32>(menu, 0x808, 2);
         } else if (!BbscCurtainActive()) {
             // 2026-10-05 (tester): "it shows me pop in for a second and then it shows me the load
@@ -7343,6 +7515,122 @@ void TickBbscDeathCurtain() {
     }
 }
 
+// ---- Fall guard after a far lamp ----------------------------------------------------------------
+// A guest respawned at a host's lamp far from the host can land where the map is not loaded yet
+// and fall (2026-10-20 09:58, the lamp about 290 m away). Beside the host instead was no better:
+// the guest came back in the dark next to the host's enemies and died again 3.5 s after the
+// revive (2026-10-21 00:00:01, the host's lamp 189 m away), and the user wants the lamp. So the
+// lamp it is, and for 25 s this watches the guest: falling fast (over 6 m in 1 s) and 15 m below
+// the lamp means there was no floor. The first time the guest is put back on the lamp, by then the
+// game has loaded the ground around it; the second time beside the host.
+// The same after a join (2026-10-25, the user: "if invoked in the atelier, second player fall"):
+// the guest placed beside the host in the Hunter's Dream workshop died 35 s later and the game
+// sent it home. For 40 s after the join teleport, a fall puts it back on that spot, and a second
+// fall at the lamp of the map nearest to it (the spot beside the host is where it fell).
+constexpr s64 BbscLampGuardMs = 25'000;
+constexpr s64 BbscJoinGuardMs = 40'000;
+constexpr float BbscLampGuardBelowM = 15.0f;
+constexpr float BbscLampGuardDropPerSecondM = 6.0f;
+struct BbscLampGuard {
+    s64 since_ms = 0; // 0 = off
+    BbscTransform lamp{}; // or the spot beside the host, after a join
+    s64 sample_ms = 0;
+    float sample_y = 0.0f;
+    bool put_back = false;
+    bool join = false;
+};
+BbscLampGuard bbsc_lamp_guard;
+
+void ArmBbscJoinFallGuard(const BbscTransform& spot) {
+    bbsc_lamp_guard = {};
+    bbsc_lamp_guard.since_ms = SteadyNowMs();
+    bbsc_lamp_guard.lamp = spot;
+    bbsc_lamp_guard.join = true;
+}
+
+bool WarpBbscLocalPlayer(u64 player, const BbscTransform& to) {
+    const u64 vtable = ReadValue<u64>(player, 0);
+    const u64 warp = ReadablePointer(vtable, 0x600) ? ReadValue<u64>(vtable, 0x5F8) : 0;
+    if (!IsEbootCodeAddress(warp)) {
+        return false;
+    }
+    alignas(16) std::array<float, 4> position = to.position;
+    alignas(16) std::array<float, 4> rotation = to.rotation;
+    position[3] = 1.0f;
+    rotation[3] = 0.0f;
+    using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
+    reinterpret_cast<Warp>(warp)(player, position.data(), rotation.data(), 1);
+    WriteValue<u8>(player, 0x1E4, static_cast<u8>(ReadValue<u8>(player, 0x1E4) | 0x02));
+    using PhysicsReset = void PS4_SYSV_ABI (*)(u64 chr, u8 flag);
+    reinterpret_cast<PhysicsReset>(image_base + 0x018BCF30)(player, 1); // as the F8 unstuck
+    return true;
+}
+
+void TickBbscLampGuard() {
+    BbscLampGuard& guard = bbsc_lamp_guard;
+    if (guard.since_ms == 0) {
+        return;
+    }
+    const s64 now = SteadyNowMs();
+    const s32 session_state = GetSessionState();
+    const u64 player = GetLocalPlayerCharacter();
+    const auto here = player != 0 ? ReadCharacterTransform(player) : std::nullopt;
+    if (session_state != 6 || !here.has_value() || GetCharacterHp(player) <= 0) {
+        guard.since_ms = 0;
+        return;
+    }
+    const s64 window = guard.join ? BbscJoinGuardMs : BbscLampGuardMs;
+    const std::string_view spot = guard.join ? "the spot beside the host" : "the far lamp";
+    if (now - guard.since_ms > window) {
+        LOG_INFO(Debug, "BBSC {}: {} held (no fall in {} s)", guard.join ? "join" : "respawn", spot,
+                 window / 1000);
+        guard.since_ms = 0;
+        return;
+    }
+    const float y = here->position[1];
+    if (guard.sample_ms == 0 || now - guard.sample_ms < 1'000) {
+        if (guard.sample_ms == 0) {
+            guard.sample_ms = now;
+            guard.sample_y = y;
+        }
+        return;
+    }
+    const float drop = guard.sample_y - y;
+    guard.sample_ms = now;
+    guard.sample_y = y;
+    if (drop < BbscLampGuardDropPerSecondM || guard.lamp.position[1] - y < BbscLampGuardBelowM) {
+        return;
+    }
+    if (!guard.put_back) {
+        guard.put_back = true;
+        guard.since_ms = now;
+        guard.sample_ms = 0;
+        const bool moved = WarpBbscLocalPlayer(player, guard.lamp);
+        LOG_INFO(Debug, "BBSC {}: falling below {} ({:.0f} m in 1 s, {:.0f} m under it) - {}",
+                 guard.join ? "join" : "respawn", spot, drop, guard.lamp.position[1] - y,
+                 moved ? "put back on it" : "could not move the player");
+        return;
+    }
+    guard.since_ms = 0;
+    if (guard.join) {
+        s32 point = -1;
+        const auto lamp = ResolveNearestLoadedLamp(guard.lamp.position, &point);
+        const bool moved = lamp.has_value() && WarpBbscLocalPlayer(player, *lamp);
+        LOG_INFO(Debug, "BBSC join: fell below the spot beside the host again ({:.0f} m in 1 s) - {}",
+                 drop, moved ? fmt::format("put at lamp {}, the nearest", point)
+                             : std::string("no lamp of this map to go to"));
+        return;
+    }
+    const u64 partner = FindLivingPartnerCharacter();
+    auto beside = partner != 0 ? ReadCharacterTransform(partner) : std::nullopt;
+    if (beside.has_value()) {
+        beside->position[0] += 1.0f;
+    }
+    const bool moved = beside.has_value() && WarpBbscLocalPlayer(player, *beside);
+    LOG_INFO(Debug, "BBSC respawn: fell below the far lamp again ({:.0f} m in 1 s) - {}", drop,
+             moved ? "put beside the host" : "no host to go to");
+}
+
 // Revive the local player and teleport it, without any load.
 // A lamp's respawn point id carries its map: 2412951 = area 24, block 1 -> 0x18010000.
 u32 BbscLampPointMap(s32 point) {
@@ -7383,6 +7671,9 @@ bool BbscDiedRightAfterRespawn(std::string_view why) {
     return true;
 }
 
+bool BbscHostBossBarRecent(s64 within_ms); // see "Boss name line"
+constexpr s64 BbscHostBossFightNearMs = 5'000;
+constexpr float BbscLampNearHostM = 150.0f; // see "A lamp far from the host" below
 bool BbscRespawnInPlace(std::string_view why) {
     // Replicates the local-player branch of the game's event revive 0x013CBAD0(10000, ...)
     // (CONFIRMED statically), in the same order, WITHOUT its final CSMultiPlayMan::Stop call:
@@ -7466,8 +7757,51 @@ bool BbscRespawnInPlace(std::string_view why) {
                 where = "partner";
             }
         }
+        // A lamp far from the host can be in a part of the map that is not loaded here: the guest
+        // revived there and died again 18 s later, death cause 7 (a fall; 2026-10-20 09:58, the
+        // lamp about 290 m from the host). Beside the host instead, where the world is loaded.
+        // Not beside a host who is fighting a boss, though (2026-10-20 Paarl: the guest came back
+        // in the arena): then the lamp nearest the body, below.
+        const bool host_in_boss_fight = BbscHostBossBarRecent(BbscHostBossFightNearMs);
+        if (target.has_value() && where == "host's last lamp" && partner_here) {
+            if (const u64 partner = FindLivingPartnerCharacter()) {
+                if (const auto host = ReadCharacterTransform(partner)) {
+                    const float dx = target->position[0] - host->position[0];
+                    const float dy = target->position[1] - host->position[1];
+                    const float dz = target->position[2] - host->position[2];
+                    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (distance > BbscLampNearHostM && host_in_boss_fight) {
+                        LOG_INFO(Debug, "BBSC respawn: the host's last lamp is {:.0f} m from the "
+                                        "host, who is in a boss fight - the lamp nearest the body "
+                                        "instead",
+                                 distance);
+                        target.reset();
+                    } else if (distance > BbscLampNearHostM) {
+                        LOG_INFO(Debug, "BBSC respawn: the host's last lamp is {:.0f} m from the "
+                                        "host (over {:.0f}) - the lamp anyway, with a fall guard",
+                                 distance, BbscLampNearHostM);
+                        bbsc_lamp_guard = {};
+                        bbsc_lamp_guard.since_ms = SteadyNowMs();
+                        bbsc_lamp_guard.lamp = *target;
+                    }
+                }
+            }
+        }
     } else {
         target = ResolveLastLampTransform();
+    }
+    // Revived because the boss died while we were down: come back beside the hunter who survived,
+    // not at the lamp (2026-10-20, the user: the guest died at the boss, the host killed it, and
+    // the guest came back at the previous lamp). The boss is dead, so its arena is safe now, and
+    // the survivor's map is the one loaded here.
+    if (why == "boss killed" && partner_here) {
+        if (const u64 partner = FindLivingPartnerCharacter()) {
+            if (auto beside = ReadCharacterTransform(partner)) {
+                beside->position[0] += 1.0f; // not inside them, as the wipe warp does
+                target = beside;
+                where = "survivor";
+            }
+        }
     }
     if (!target.has_value()) {
         if (const auto body = ReadCharacterTransform(player)) {
@@ -7535,6 +7869,16 @@ bool BbscRespawnInPlace(std::string_view why) {
                                                                  image_base + 0x04992C40);
     }
 
+    // Timed effects off before the HP refill, as a normal death's reload would: an effect that lowers
+    // the maximum HP would otherwise cap the refill (the user, 2026-10-21: the host died of poison and
+    // came back with half its life).
+    std::string cured_ids;
+    if (const size_t cured = BbscCureStatusAfterRevive(&cured_ids); cured != 0) {
+        LOG_INFO(Debug, "BBSC respawn in place ({}): {} timed effect(s) taken off before the HP refill, "
+                        "as the reload of a normal death would [{}]",
+                 why, cured, cured_ids);
+    }
+
     // 4. state reset, HP, death flags, drawing
     using Reset = void PS4_SYSV_ABI (*)(u64 chr);
     reinterpret_cast<Reset>(reset)(player);
@@ -7590,6 +7934,9 @@ bool BbscRespawnInPlace(std::string_view why) {
     if (where == "host's last lamp") {
         BbscAnnounceAfterCurtain(u"You respawned at the host's lamp.",
                                  "respawn at the host's lamp");
+    } else if (where == "survivor") {
+        BbscAnnounceAfterCurtain(u"You respawned next to the hunter who survived.",
+                                 "respawn beside the survivor");
     } else if (where == "partner") {
         BbscAnnounceAfterCurtain(u"You respawned next to the host.",
                                  "respawn beside the host");
@@ -8101,6 +8448,46 @@ constexpr u32 DeathTextEventId = 0xFFA;
 s32 bbsc_echoes_at_death = -1;
 bool bbsc_kept_death_this_load = false; // see BbscRepeatDeathMs
 
+// Where the bloodstain goes (2026-10-21, the user: "where are Eric's echoes from the death? we
+// can't find it"). A guest's stain is placed at the forced summon placement (global+0x14F0 map,
+// +0x1500 position), not where it died: the 15:53 death in map 0x18020000 left its 19150 echoes in
+// the Hunter's Dream at the spot of the follow warp 40 minutes before, and the wipe at Cainhurst
+// left 7994 at the host's lamp. The living player's spot is noted every second (one from just
+// before the death, not a body in mid-fall), and the drop is given that spot.
+struct BbscDeathSpot {
+    std::array<float, 3> position{};
+    u32 map = 0;
+    s64 ms = 0;
+};
+BbscDeathSpot bbsc_alive_spot; // refreshed every second while alive, not loading
+BbscDeathSpot bbsc_death_spot; // the alive spot when the HP hit zero
+
+void TickBbscDeathSpot() {
+    static s64 last_ms = 0;
+    static bool was_dead = false;
+    const s64 now = SteadyNowMs();
+    const u64 player = GetLocalPlayerCharacter();
+    const s32 hp = ReadablePointer(player, 0x3B8) ? GetCharacterHp(player) : -1;
+    const u64 global = GetGlobalState();
+    const bool loading = !ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0;
+    if (hp == 0 && !was_dead) {
+        was_dead = true;
+        bbsc_death_spot = now - bbsc_alive_spot.ms <= 3'000 ? bbsc_alive_spot : BbscDeathSpot{};
+    } else if (hp > 0) {
+        was_dead = false;
+    }
+    if (hp <= 0 || loading || now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    const u32 map = GetCurrentPackedMap();
+    const auto here = ReadCharacterTransform(player);
+    if (!here.has_value() || !IsUsablePackedMap(map)) {
+        return;
+    }
+    bbsc_alive_spot = {{here->position[0], here->position[1], here->position[2]}, map, now};
+}
+
 // Code review 2026-09-23 A1 (CONFIRMED from the decompile of 0x013824C0): PartyGhostDeath_2 starts
 // by deleting the objects at global+0x1698 and +0x16B8 and zeroing +0x1690 / +0x16B0. Those are
 // the own-world save snapshot 0x0131E5C0 builds when a guest is summoned, which the save writer
@@ -8239,14 +8626,231 @@ void ShowBbscGuestDeathText(u64 event_object) {
     RaiseBbscDeathText(event_object, "guest");
 }
 
+// ---- A guest's echoes in a wipe go with the host's bloodstain (2026-10-25) -----------------------
+// The game shows and picks up a bloodstain only in its owner's world (0x013D2DC0 checks
+// global+0x1592), so a guest's stain from a wipe lay in its own world, never where it fell (the
+// user: "2nd player lost his echoes, no way to get them back after a wipe"). The user's rule: the
+// guest's echoes go with the host's bloodstain of that wipe. The host picks it up: they come back
+// to the guest. The host's stain is lost unpicked (it died again): they are lost too. The session
+// ends first, or no stain of the host's comes: the guest keeps them.
+// Host: its stain record is watched every second ([0x0553B130]+0x28 "a stain exists",
+// [[0x0553B130]+0x30] +0x38 echoes, +0x18 spot, +0x3C map). A new one, one picked up (gone while
+// the echoes rose by what it held) and one replaced unpicked are sent with the stain's number. One
+// gone without the echoes (an enemy took them) counts as picked up when the echoes later rise by
+// that much at once, before the next stain.
+constexpr u8 BbscStainType = 0x2B;
+constexpr s64 BbscStainBindMs = 60'000;     // a host's new stain this close to our wipe is its
+constexpr s64 BbscStainUnboundMs = 120'000; // no stain of the host's came: the guest keeps them
+struct BbscGuestStainEchoes {
+    s32 amount = 0;
+    u32 stain = 0; // the host's stain they went with, 0 = not known yet
+    s64 since_ms = 0;
+};
+std::mutex bbsc_stain_mutex;
+BbscGuestStainEchoes bbsc_stain_held; // guest, game thread
+u32 bbsc_stain_host_new = 0;          // guest: the host's last new stain, and when it came
+s64 bbsc_stain_host_new_ms = 0;
+std::vector<std::pair<u8, u32>> bbsc_stain_events; // guest: from the relay, for the game tick
+
+void SendBbscStainPacket(u8 kind, u32 stain) {
+    std::array<u8, 10> packet{'S', 'H', 'A', 'D', BbscStainType, kind};
+    std::memcpy(packet.data() + 6, &stain, 4);
+    Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(packet.data(),
+                                                                    static_cast<u32>(packet.size()));
+}
+
+// Guest: the echoes held at our death leave us and wait for the host's bloodstain.
+void HoldBbscWipeEchoes(s32 amount, std::string_view why) {
+    const u64 local = GetPlayerSlotData();
+    const s32 now = GetBloodEchoes();
+    if (local == 0 || now < 0 || amount <= 0) {
+        return;
+    }
+    const s32 taken = std::min(amount, now);
+    WriteValue<s32>(local, PlayerEchoesOffset, now - taken);
+    const s64 at = SteadyNowMs();
+    bbsc_stain_held.amount += taken;
+    bbsc_stain_held.since_ms = at;
+    bbsc_stain_held.stain = bbsc_stain_host_new != 0 && at - bbsc_stain_host_new_ms < BbscStainBindMs
+                                ? bbsc_stain_host_new
+                                : 0;
+    LOG_INFO(Debug, "BBSC death penalty ({}): a guest in a wipe - {} echoes go with the host's "
+                    "bloodstain ({}), {} held in all",
+             why, taken,
+             bbsc_stain_held.stain != 0 ? fmt::format("its stain {}", bbsc_stain_held.stain)
+                                        : std::string("its next stain"),
+             bbsc_stain_held.amount);
+}
+
+void GiveBackBbscWipeEchoes(std::string_view why) {
+    const u64 local = GetPlayerSlotData();
+    const s32 now = GetBloodEchoes();
+    if (bbsc_stain_held.amount <= 0 || local == 0 || now < 0) {
+        return;
+    }
+    WriteValue<s32>(local, PlayerEchoesOffset, now + bbsc_stain_held.amount);
+    LOG_INFO(Debug, "BBSC wipe echoes: {} echoes back ({}), now {}", bbsc_stain_held.amount, why,
+             GetBloodEchoes());
+    bbsc_stain_held = {};
+}
+
+// Game thread: the host watches its stain, the guest acts on the host's.
+void TickBbscWipeEchoes() {
+    static s64 last_ms = 0;
+    const s64 now = SteadyNowMs();
+    if (image_base == 0 || now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    const s32 state = GetSessionState();
+    const u64 global = GetGlobalState();
+    const bool loading = !ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0;
+
+    // Host.
+    static u32 stain = 0;               // our stain's number
+    static bool seen = false;           // the record was read once in this session
+    static u8 last_exists = 0;
+    static s32 last_held = 0;
+    static std::array<u32, 4> last_spot{}; // x, y, z, map as raw bits
+    static s32 last_echoes = -1;
+    static s32 taken_held = -1;            // gone without the echoes: an enemy may hold them
+    if (state != 3) {
+        seen = false;
+        taken_held = -1;
+    } else if (!loading) {
+        const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+        const u64 record = ReadablePointer(slots, 0x38) ? ReadValue<u64>(slots, 0x30) : 0;
+        const s32 echoes = GetBloodEchoes();
+        if (ReadablePointer(record, 0x40) && echoes >= 0) {
+            const u8 exists = ReadValue<u8>(slots, 0x28);
+            const s32 held = ReadValue<s32>(record, 0x38);
+            const std::array<u32, 4> spot{ReadValue<u32>(record, 0x18), ReadValue<u32>(record, 0x1C),
+                                          ReadValue<u32>(record, 0x20), ReadValue<u32>(record, 0x3C)};
+            const bool there = exists != 0 && held > 0;
+            const bool was = last_exists != 0 && last_held > 0;
+            if (!seen) {
+                seen = true; // a stain from before the session is not one of its wipes
+            } else if (there && (!was || held != last_held || spot != last_spot)) {
+                if (was) {
+                    SendBbscStainPacket(3, stain);
+                    LOG_INFO(Debug, "BBSC wipe echoes: our stain {} replaced before it was picked up "
+                                    "- lost (sent)",
+                             stain);
+                }
+                ++stain;
+                taken_held = -1;
+                SendBbscStainPacket(1, stain);
+                LOG_INFO(Debug, "BBSC wipe echoes: our new stain {} holds {} (sent)", stain, held);
+            } else if (!there && was) {
+                if (last_echoes >= 0 && echoes - last_echoes >= last_held) {
+                    SendBbscStainPacket(2, stain);
+                    LOG_INFO(Debug, "BBSC wipe echoes: our stain {} picked up ({} echoes, sent)",
+                             stain, last_held);
+                } else {
+                    taken_held = last_held;
+                    LOG_INFO(Debug, "BBSC wipe echoes: our stain {} gone without its {} echoes "
+                                    "(an enemy holds them?) - waiting for them",
+                             stain, last_held);
+                }
+            } else if (taken_held > 0 && last_echoes >= 0 && echoes - last_echoes >= taken_held) {
+                SendBbscStainPacket(2, stain);
+                LOG_INFO(Debug, "BBSC wipe echoes: our stain {}'s {} echoes came back (sent)", stain,
+                         taken_held);
+                taken_held = -1;
+            }
+            last_exists = exists;
+            last_held = held;
+            last_spot = spot;
+            last_echoes = echoes;
+        }
+    }
+
+    // Guest.
+    std::vector<std::pair<u8, u32>> events;
+    {
+        std::scoped_lock lock{bbsc_stain_mutex};
+        events.swap(bbsc_stain_events);
+    }
+    for (const auto& [kind, host_stain] : events) {
+        if (kind == 1) {
+            bbsc_stain_host_new = host_stain;
+            bbsc_stain_host_new_ms = now;
+            if (bbsc_stain_held.amount > 0 && bbsc_stain_held.stain == 0) {
+                bbsc_stain_held.stain = host_stain;
+                LOG_INFO(Debug, "BBSC wipe echoes: our {} echoes go with the host's stain {}",
+                         bbsc_stain_held.amount, host_stain);
+            }
+        } else if (bbsc_stain_held.amount > 0 && host_stain == bbsc_stain_held.stain) {
+            if (kind == 2 && !loading) {
+                GiveBackBbscWipeEchoes("the host picked up its bloodstain");
+                BbscAnnounce(u"The host recovered the blood echoes.\nYours came back too.",
+                             "wipe echoes back");
+            } else if (kind == 2) {
+                std::scoped_lock lock{bbsc_stain_mutex};
+                bbsc_stain_events.emplace_back(kind, host_stain); // after the load
+            } else if (kind == 3) {
+                LOG_INFO(Debug, "BBSC wipe echoes: the host's stain {} was lost - our {} echoes "
+                                "with it",
+                         host_stain, bbsc_stain_held.amount);
+                bbsc_stain_held = {};
+            }
+        }
+    }
+    if (bbsc_stain_held.amount > 0 && !loading) {
+        if (state != 6) {
+            GiveBackBbscWipeEchoes("the session ended before the host picked up its stain");
+        } else if (bbsc_stain_held.stain == 0 && now - bbsc_stain_held.since_ms > BbscStainUnboundMs) {
+            GiveBackBbscWipeEchoes("no bloodstain of the host's came");
+        }
+    }
+}
+
 // Drop the stain unless the game already did it for this death. Returns true when BBSC made the
 // call itself.
+// The player's stain record ([[0x0553B130]+0x30]: +0x18 the spot, +0x3C the map, +0x38 the
+// echoes) put where the player died, when the drop placed it in another map or more than 3 m away.
+// After a wipe reload the drop still put a guest's stain in the Hunter's Dream (2026-10-21
+// 00:00:35), and the game's own drop (the death step's, which BBSC leaves alone since 0.0.2) uses
+// the same forced placement.
+void CorrectBbscStainRecord(const BbscDeathSpot& spot, std::string_view why) {
+    if (spot.ms == 0 || !IsUsablePackedMap(spot.map)) {
+        return;
+    }
+    const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+    const u64 record = ReadablePointer(slots, 0x38) ? ReadValue<u64>(slots, 0x30) : 0;
+    if (!ReadablePointer(record, 0x40) || ReadValue<s32>(record, 0x38) <= 0) {
+        return;
+    }
+    const float dx = ReadValue<float>(record, 0x18) - spot.position[0];
+    const float dy = ReadValue<float>(record, 0x1C) - spot.position[1];
+    const float dz = ReadValue<float>(record, 0x20) - spot.position[2];
+    if (ReadValue<u32>(record, 0x3C) == spot.map && dx * dx + dy * dy + dz * dz <= 9.0f) {
+        return;
+    }
+    LOG_INFO(Debug, "BBSC bloodstain ({}): the drop put it in map {:#x} at ({:.1f}, {:.1f}, {:.1f}) - "
+                    "moved to where we died, map {:#x} at ({:.1f}, {:.1f}, {:.1f})",
+             why, ReadValue<u32>(record, 0x3C), ReadValue<float>(record, 0x18),
+             ReadValue<float>(record, 0x1C), ReadValue<float>(record, 0x20), spot.map,
+             spot.position[0], spot.position[1], spot.position[2]);
+    for (size_t i = 0; i < 3; ++i) {
+        WriteValue<float>(record, 0x18 + i * 4, spot.position[i]);
+    }
+    WriteValue<u32>(record, 0x3C, spot.map);
+}
+
 bool BbscApplyDeathPenalty(std::string_view why) {
     if (!BbscDeathPenaltyEnabled() || image_base == 0) {
         return false;
     }
     const s32 before = bbsc_echoes_at_death;
     bbsc_echoes_at_death = -1;
+    // A guest's echoes in a wipe go with the host's bloodstain, see HoldBbscWipeEchoes. Its own
+    // stain would lie in its own world, and dropped after the reload it was worse: map 0xffffffff
+    // (2026-10-25 01:22, 108932 echoes).
+    if (bbsc_spectate_saw_wipe && GetSessionState() == 6) {
+        HoldBbscWipeEchoes(before, why);
+        return false;
+    }
     s32 now = GetBloodEchoes();
     if (before < 0 || now < 0) {
         return false; // no snapshot, or the slot data went away with the world
@@ -8267,6 +8871,8 @@ bool BbscApplyDeathPenalty(std::string_view why) {
             BBSC_TIMELINE("DEATH", "death penalty ({}): game's drop - stain holds {} (had {} at the "
                             "death step, exists {})",
                      why, held, before, exists);
+            CorrectBbscStainRecord(bbsc_death_spot, "game's drop");
+            bbsc_death_spot = {};
             return false;
         }
         if (local == 0) {
@@ -8319,8 +8925,30 @@ bool BbscApplyDeathPenalty(std::string_view why) {
     if (guest) {
         WriteValue<u8>(global, 0x1592, 1);
     }
+    // The spot of the death in the forced placement for the drop, then the placement put back.
+    const BbscDeathSpot spot = bbsc_death_spot;
+    bbsc_death_spot = {};
+    const bool use_spot = spot.ms != 0 && IsUsablePackedMap(spot.map) &&
+                          ReadablePointer(global, 0x1520) &&
+                          HasMemoryAccess(global + 0x14F0, 0x20, MemoryProt::CpuWrite);
+    u32 saved_map = 0;
+    std::array<float, 3> saved_position{};
+    if (use_spot) {
+        saved_map = ReadValue<u32>(global, 0x14F0);
+        for (size_t i = 0; i < 3; ++i) {
+            saved_position[i] = ReadValue<float>(global, 0x1500 + i * 4);
+            WriteValue<float>(global, 0x1500 + i * 4, spot.position[i]);
+        }
+        WriteValue<u32>(global, 0x14F0, spot.map);
+    }
     using DropBloodstain = void PS4_SYSV_ABI (*)(u64 stain_root, u64 chr, u8 drop);
     reinterpret_cast<DropBloodstain>(image_base + DropBloodstainOffset)(stain_root, player, 1);
+    if (use_spot) {
+        WriteValue<u32>(global, 0x14F0, saved_map);
+        for (size_t i = 0; i < 3; ++i) {
+            WriteValue<float>(global, 0x1500 + i * 4, saved_position[i]);
+        }
+    }
     if (guest) {
         WriteValue<u8>(global, 0x1592, 0);
     }
@@ -8347,11 +8975,30 @@ bool BbscApplyDeathPenalty(std::string_view why) {
                      why, earned_while_dead, before);
         }
     }
+    // The record's map and spot (+0x3C, +0x18), so a test shows where the stain went.
+    const bool record_ok = ReadablePointer(record, 0x40);
+    const u32 stain_map = record_ok ? ReadValue<u32>(record, 0x3C) : 0;
+    const float stain_x = record_ok ? ReadValue<float>(record, 0x18) : 0.0f;
+    const float stain_y = record_ok ? ReadValue<float>(record, 0x1C) : 0.0f;
+    const float stain_z = record_ok ? ReadValue<float>(record, 0x20) : 0.0f;
     LOG_INFO(Debug,
-             "BBSC death penalty ({}): dropped {} echoes (now {}, stain holds {}, type {}, gate {})",
-             why, before, GetBloodEchoes(), in_stain, GetLocalPlayerType(), gate);
-    BBSC_TIMELINE("DEATH", "death penalty ({}): dropped {} echoes (now {}, stain holds {}, type {}, gate {})",
-             why, before, GetBloodEchoes(), in_stain, GetLocalPlayerType(), gate);
+             "BBSC death penalty ({}): dropped {} echoes (now {}, stain holds {} in map {:#x} at "
+             "({:.1f}, {:.1f}, {:.1f}), type {}, gate {})",
+             why, before, GetBloodEchoes(), in_stain, stain_map, stain_x, stain_y, stain_z,
+             GetLocalPlayerType(), gate);
+    BBSC_TIMELINE("DEATH", "death penalty ({}): dropped {} echoes (now {}, stain holds {} in map {:#x}, type {}, gate {})",
+             why, before, GetBloodEchoes(), in_stain, stain_map, GetLocalPlayerType(), gate);
+    if (use_spot) {
+        CorrectBbscStainRecord(spot, why);
+    }
+    if (ReadablePointer(record, 0x40)) {
+        LOG_INFO(Debug, "BBSC bloodstain: placed in map {:#x} at ({:.1f}, {:.1f}, {:.1f}); died in map "
+                        "{:#x} at ({:.1f}, {:.1f}, {:.1f}){}",
+                 ReadValue<u32>(record, 0x3C), ReadValue<float>(record, 0x18),
+                 ReadValue<float>(record, 0x1C), ReadValue<float>(record, 0x20), spot.map,
+                 spot.position[0], spot.position[1], spot.position[2],
+                 use_spot ? "" : " (no spot noted - the game's own placement)");
+    }
     return true;
 }
 
@@ -8455,7 +9102,8 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
     bbsc_spectate_saw_wipe = guest_waits_for_host;
     bbsc_spectate_wipe_warped = false;
     bbsc_spectate_host_back_ms = 0;
-    bbsc_spectate_revivals_at_death = bbsc_peer_revivals.load();
+    bbsc_spectate_revivals_at_death =
+        bbsc_own_down ? bbsc_revivals_at_own_down : bbsc_peer_revivals.load();
     bbsc_boss_cleared_since_ms = 0;
     bbsc_death_mode = BbscBossFightAtDeath() || guest_waits_for_host ? BbscDeathMode::Spectate
                                                                       : BbscDeathMode::RespawnNow;
@@ -8497,9 +9145,17 @@ void TickBbscSpectate() {
         LOG_INFO(Debug, "BBSC spectate: a partner said dead and then alive while we were down - "
                         "it reloaded after a wipe, the guest follows");
     }
-    if (session_alive && LivingPartnerExists()) {
+    // After the wipe warp the new character is up as soon as a partner says it is alive: the
+    // host's copy took about 6 s to appear in the guest's reloaded world (2026-10-24 20:21), the
+    // new character had no HP meanwhile, and the game ran its death again 6 s after the load.
+    const u64 now_chr = GetLocalPlayerCharacter();
+    const auto [peers_fresh, peers_dead] = BbscPeerLifeCounts();
+    const bool new_after_wipe = bbsc_spectate_wipe_warped && now_chr != 0 &&
+                                bbsc_spectate_chr != 0 && now_chr != bbsc_spectate_chr &&
+                                peers_fresh > peers_dead;
+    if (session_alive && (LivingPartnerExists() || new_after_wipe)) {
         std::string_view respawn_why;
-        const u64 chr = GetLocalPlayerCharacter();
+        const u64 chr = now_chr;
         if (bbsc_death_mode == BbscDeathMode::RespawnNow) {
             respawn_why = "no boss fight";
         } else if (chr != 0 && bbsc_spectate_chr != 0 && chr != bbsc_spectate_chr) {
@@ -8527,6 +9183,23 @@ void TickBbscSpectate() {
                 to.y = host_transform->position[1];
                 to.z = host_transform->position[2];
                 to.heading = host_transform->rotation[1];
+                // Our death step left the load set up as our own death's (event state
+                // [0x0553B0D8] = 2, the death globals +0x1522 / +0x1523), and the wipe warp went
+                // out as a respawn at our own last lamp (stage request subtype 2) instead of the
+                // host's spot (subtype 1, as a follow load). 2026-10-25 17:07: the guest's last
+                // lamp was in the Hunter's Dream, it woke up there, and a follow load had to bring
+                // it to the host. Before, it only worked when the guest's own lamp was in the host's
+                // map (2026-10-24 21:14: subtype 2, lamp 2422951). Cleared here as the revive in
+                // place clears them. HYPOTHESIS that these pick subtype 2; the trace shows it.
+                if (const u64 global = GetGlobalState(); ReadablePointer(global, 0x1528)) {
+                    WriteValue<u8>(global, 0x1522, 0);
+                    WriteValue<u8>(global, 0x1523, 0);
+                }
+                if (const u64 event_state = ReadValue<u64>(image_base + 0x0553B0D8, 0);
+                    ReadablePointer(event_state, 4) &&
+                    HasMemoryAccess(event_state, 4, MemoryProt::CpuWrite)) {
+                    WriteValue<s32>(event_state, 0, 0);
+                }
                 if (RequestBbscSessionWarp(GetGlobalState(), to, "wipe")) {
                     return; // the load builds a new character: "a load ended the boss fight"
                 }
@@ -8557,7 +9230,17 @@ void TickBbscSpectate() {
         }
         if (!respawn_why.empty()) {
             BbscApplyDeathPenalty(respawn_why);
-            if (StartBbscDeathCurtain(respawn_why) || BbscRespawnInPlace(respawn_why)) {
+            // Under a wipe's load cover the screen is already covered: a death curtain on top showed
+            // the loading screen twice with black between (2026-10-21, the user: "Bloodborne screen
+            // 2 s, black 2 s, Bloodborne 2 s"), and its forced close left the loading screen's state
+            // stuck. The revive happens under the cover, which fades in once it is done.
+            const bool under_cover = BbscLoadCoverActive();
+            if (under_cover) {
+                LOG_INFO(Debug, "BBSC death: {} - revived under the load cover, no death curtain",
+                         respawn_why);
+            }
+            if ((!under_cover && StartBbscDeathCurtain(respawn_why)) ||
+                BbscRespawnInPlace(respawn_why)) {
                 bbsc_spectate_active = false;
                 return;
             }
@@ -8619,12 +9302,33 @@ void TickBbscSpectate() {
 constexpr u64 BlockClear2FirstOffset = 0x01385470; // BlockClear2_1
 constexpr u64 BlockClear2LeaveOffset = 0x013858A0; // BlockClear2_3Leave
 constexpr u64 BlockClear2HomeOffset = 0x01385930;  // BlockClear2_3
+constexpr u64 BlockClear2Offset = 0x013849A0;      // BlockClear2 (rewards, then BlockClear2_1)
+// A guest's BlockClear2 with no boss fight anywhere (2026-10-19, guest log 23:26:47-23:27:16): the
+// guest followed the host into an area whose boss the host had killed long before. Writing the
+// host's flags there made the area's boss event run the whole clear chain on the guest - a "prey"
+// banner and the after-boss locks, X did nothing until the game was restarted. So on a guest it
+// only runs when its own boss bar was up in the last BbscBossClearFightMs: a guest in a real kill
+// always has it. The host's bar does not count (test 2026-10-19 23:44: the host was in Darkbeast
+// Paarl's fight, the guest had no bar of its own and still got Paarl's clear chain and reward,
+// though nobody killed Paarl), and a "boss killed" word from the host would come too late - the
+// guest's BlockClear2 ran before the host's at the 15:13 kill.
+constexpr s64 BbscBossClearFightMs = 60'000;
+u8 bbsc_boss_clear_skip = 0;
+bool BbscHostBossFightRecent(s64 within_ms); // the host's boss bar, see "Boss name line"
+// What a real boss kill leaves on the guest, logged for BbscBossProbeMs after BlockClear2_1 (the X
+// button stays dead after a boss even with TickBbscBossUnlock; the cause is not known yet). The
+// clear gives the guest SpEffect 4680 (stateInfo 119): if it is still on, it is taken off.
+constexpr s64 BbscBossProbeMs = 30'000;
+constexpr s32 BbscBossClearEffectId = 4680;
+s64 bbsc_boss_probe_until_ms = 0;
 u8 bbsc_boss_leave_skip = 0;
 u8 bbsc_boss_home_skip = 0;
 // After a guest skipped BlockClear2_3: clear its locks for this long, see TickBbscBossUnlock.
 constexpr s64 BbscBossUnlockMs = 20'000;
 s64 bbsc_boss_unlock_until_ms = 0;
 s64 bbsc_gate_watch_since_ms = 0; // the guest's last boss clear, see TickBbscGateWatch
+// Set by BlockClear2_1 on a guest, cleared when the session ends; see TickBbscBossLeaveMark.
+bool bbsc_boss_guest_kept = false;
 
 bool BbscSessionAlive() {
     const s32 state = GetSessionState();
@@ -8696,13 +9400,40 @@ void PS4_SYSV_ABI BbscBossClearHook(u64 tag, const GuestRegisterSnapshot* regist
     if (registers == nullptr || !BbscSessionAlive()) {
         return;
     }
+    if (tag == 3) {
+        const s64 now = SteadyNowMs();
+        const bool own_bar = BossFightActive() || (bbsc_boss_bar_seen_ms != 0 &&
+                                                   now - bbsc_boss_bar_seen_ms <= BbscBossClearFightMs);
+        if (LocalPlayerType() == 1 && !own_bar) {
+            bbsc_boss_clear_skip = 1;
+            // Integration (pr/9 + pr/14): a guest can be spectating on the HOST's boss bar alone
+            // (BbscBossFightAtDeath). With BlockClear2 skipped here, BlockClear2_1 (tag 0) never
+            // runs on it, so nothing would set bbsc_boss_killed_ms and TickBbscSpectate's "boss
+            // killed" release would never come. The host's kill still ends that spectate.
+            if (bbsc_spectate_active && BbscHostBossFightRecent(BbscBossClearFightMs)) {
+                bbsc_boss_killed_ms = now;
+                LOG_INFO(Debug, "BBSC boss clear: the spectating guest is released on the host's "
+                                "kill (no own boss bar)");
+            }
+            LOG_INFO(Debug, "BBSC boss clear: BlockClear2 on the guest without its own boss bar in "
+                            "the last {} s (a boss flag from the host's world?) - skipped (host's "
+                            "bar {})",
+                     BbscBossClearFightMs / 1'000,
+                     BbscHostBossFightRecent(BbscBossClearFightMs) ? "seen" : "not seen");
+        }
+        return;
+    }
     if (tag == 0) {
         GuardBbscBossClearCoopCount();
         bbsc_boss_killed_ms = SteadyNowMs();
         if (LocalPlayerType() == 1) {
             bbsc_gate_watch_since_ms = bbsc_boss_killed_ms;
+            bbsc_boss_guest_kept = true;
         }
         ArmBbscDeathLockClear();
+        if (LocalPlayerType() == 1) {
+            bbsc_boss_probe_until_ms = bbsc_boss_killed_ms + BbscBossProbeMs;
+        }
         LOG_INFO(Debug, "BBSC boss clear: BlockClear2_1 (player type {}), session kept{}",
                  LocalPlayerType(),
                  bbsc_spectate_active ? " - the spectating player respawns" : "");
@@ -8797,7 +9528,10 @@ void InstallBbscBossClearHooks() {
                              &bbsc_boss_leave_skip) &&
         InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BlockClear2HomeOffset),
                              std::span<const u8>{PushRbxRax}, 2, BbscBossClearHook,
-                             &bbsc_boss_home_skip);
+                             &bbsc_boss_home_skip) &&
+        InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BlockClear2Offset),
+                             std::span<const u8>{PushR15}, 3, BbscBossClearHook,
+                             &bbsc_boss_clear_skip);
     if (!ok) {
         LOG_ERROR(Debug, "BBSC boss clear: failed to hook the BlockClear2 chain");
         return;
@@ -8888,6 +9622,57 @@ void BbscLeaveItemUsed(std::string_view event) {
     }
 }
 
+
+// A guest's own "leaving" mark after a boss kill. BlockClear2_2 (0x01385760) starts custom call 4063
+// with the local player id, and OnGameLeave then calls ReqularLeavePlayer (0x01337500), which sets
+// our slot's byte [0x0553B130]+0xA9+slot*2: the state of a phantom on its way home. The death-lock
+// clearing only covers 15 s after the kill, and the guest could not pick up items or use ladders and
+// doors after it (test 2026-10-19). While a guest stays in the session after a boss, its own mark
+// is cleared here, unless it is really leaving (Silencing Blank, quit to the title).
+constexpr s64 BbscDeliberateLeaveMs = 60'000;
+
+void TickBbscBossLeaveMark() {
+    static s64 last_ms = 0;
+    const s64 now = SteadyNowMs();
+    if (!bbsc_boss_guest_kept || image_base == 0 || now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    if (GetSessionState() != 6) {
+        bbsc_boss_guest_kept = false;
+        return;
+    }
+    if (bbsc_persistence_restore_at_ms != 0 ||
+        (bbsc_leave_event_ms.load() != 0 && now - bbsc_leave_event_ms.load() < BbscDeliberateLeaveMs)) {
+        return;
+    }
+    const u64 global = GetGlobalState();
+    const u64 player = GetLocalPlayerCharacter();
+    if (!ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0 || player == 0 ||
+        GetCharacterHp(player) <= 0) {
+        return;
+    }
+    const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+    if (!ReadablePointer(slots, 0xB0) || !HasMemoryAccess(slots + 0xA9, 8, MemoryProt::CpuWrite)) {
+        return;
+    }
+    const u64 own = ReadValue<u64>(slots, 0x08);
+    const u64 records = ReadValue<u64>(slots, 0x10);
+    if (!ReadablePointer(own, 0x14) || !ReadablePointer(records, 0x10 + 4 * 0x6A0)) {
+        return;
+    }
+    const s32 own_id = ReadValue<s32>(own, 0x10);
+    for (u32 slot = 0; slot < 4; ++slot) {
+        if (own_id != -1 && ReadValue<s32>(records, 0x10 + slot * 0x6A0) == own_id &&
+            ReadValue<u8>(slots, 0xA9 + slot * 2) != 0) {
+            WriteValue<u8>(slots, 0xA9 + slot * 2, 0);
+            LOG_INFO(Debug,
+                     "BBSC boss clear: our own slot {} was marked leaving (OnGameLeave) - cleared, "
+                     "the guest stays and can act",
+                     slot);
+        }
+    }
+}
 
 // Any player character in WorldChrMan that is not the local one, alive or dead.
 int RemotePlayerCount() {
@@ -9800,6 +10585,24 @@ constexpr u64 EventSfxBankOffset = 0x017C64E0;    // EMEVD bank 2006 handler (rd
 constexpr std::array<s64, 2> BbscCoopWallEvents{7600, 12907600};
 constexpr size_t BbscWallTraceLimit = 800;
 
+// A boss exit the game also shuts for multiplayer (2026-10-24, tester hosting at Ludwig's lamp:
+// the fog after the boss stayed). m34's event 13400010 raises wall 3401801 and fog 3403801 ("boss
+// 1-2 exit") while Ludwig lives (flag 9471 off) or in multiplayer state 2 or 3, and hides them only
+// when neither holds. BBSC keeps the co-op after a boss, so the exit stayed shut for the session.
+// Once the boss flag is set, the script's raises are refused as a co-op wall's are, and a wall
+// raised before the kill is hidden by TickBbscBossExitWalls. A survey of every EMEVD (a multiplayer
+// check 3[06] next to a fog-on 2006[02], 7600 / 12907600 aside) found no other wall like it.
+struct BbscBossExitWall {
+    s64 event;
+    u32 object;
+    u32 fog;
+    u32 boss_flag;
+    u32 map; // the packed map the wall lives in; the tick only acts while that map is resident
+};
+constexpr std::array<BbscBossExitWall, 1> BbscBossExitWalls{
+    {{13400010, 3401801, 3403801, 9471, 0x34000000}}};
+constexpr u64 ObjectSfxDeleteOffset = 0x01315E50; // (_, entity_id, now), what 2006[1] calls
+
 u8 bbsc_wall_draw_skip = 0;
 u8 bbsc_wall_collision_skip = 0;
 u8 bbsc_wall_sfx_skip = 0;
@@ -9889,8 +10692,12 @@ void PS4_SYSV_ABI BbscWallScriptHook(u64 tag, const GuestRegisterSnapshot* regis
         return;
     }
     const s64 event = BbscRunningEventId(instance);
+    const auto exit_wall =
+        std::find_if(BbscBossExitWalls.begin(), BbscBossExitWalls.end(),
+                     [event](const BbscBossExitWall& wall) { return wall.event == event; });
     if (std::find(BbscCoopWallEvents.begin(), BbscCoopWallEvents.end(), event) ==
-        BbscCoopWallEvents.end()) {
+            BbscCoopWallEvents.end() &&
+        (exit_wall == BbscBossExitWalls.end() || !BbscEventFlag(exit_wall->boss_flag))) {
         return;
     }
     bbsc_coop_wall_entity = static_cast<u32>(entity);
@@ -9986,6 +10793,54 @@ void InstallBbscWallHooks() {
     LOG_INFO(Debug,
              "BBSC fog walls: co-op walls kept off wherever event 7600 / 12907600 raises them "
              "(base game, DLC, Chalice); boss walls untouched");
+}
+
+// A boss exit wall raised while its boss was alive stays up in a session after the kill (the
+// script waits for the multiplayer to end): hide it once the boss flag is set, once per load and
+// session. ObjectDraw / ObjectCollision walk [0x0553B168] and the fog delete [0x0553B178] without
+// a null check.
+void TickBbscBossExitWalls() {
+    static std::array<bool, BbscBossExitWalls.size()> hidden{};
+    static s64 last_ms = 0;
+    if (image_base == 0 || !BbscNoFogWallsEnabled()) {
+        return;
+    }
+    const s64 now = SteadyNowMs();
+    if (now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    const s32 session_state = GetSessionState();
+    const u64 global = GetGlobalState();
+    if ((session_state != 3 && session_state != 6) || !ReadablePointer(global, 0x10) ||
+        ReadValue<u8>(global, 0x08) != 0) {
+        hidden.fill(false);
+        return;
+    }
+    if (ReadValue<u64>(image_base + 0x0553B168, 0) == 0 ||
+        ReadValue<u64>(image_base + 0x0553B148, 0) == 0 ||
+        ReadValue<u64>(image_base + 0x0553B178, 0) == 0) {
+        return;
+    }
+    using ObjectSwitch = u64 PS4_SYSV_ABI (*)(u32 entity_id, u32 on);
+    using SfxDelete = u64 PS4_SYSV_ABI (*)(u64 unused, u32 entity_id, u32 now);
+    for (size_t k = 0; k < BbscBossExitWalls.size(); ++k) {
+        const BbscBossExitWall& wall = BbscBossExitWalls[k];
+        // Integration: only in the wall's own map - once the boss flag is set, this tick would
+        // otherwise call the object switches for an entity that exists nowhere else, after every
+        // load in every map.
+        if (hidden[k] || !BbscMapResident(wall.map) || !BbscEventFlag(wall.boss_flag)) {
+            continue;
+        }
+        hidden[k] = true;
+        reinterpret_cast<ObjectSwitch>(image_base + ObjectDrawOffset)(wall.object, 0);
+        reinterpret_cast<ObjectSwitch>(image_base + ObjectCollisionOffset)(wall.object, 0);
+        reinterpret_cast<SfxDelete>(image_base + ObjectSfxDeleteOffset)(0, wall.fog, 1);
+        LOG_INFO(Debug,
+                 "BBSC fog wall: boss exit wall {} and fog {} hidden in the session (event {}, "
+                 "boss flag {} set, map {:#x})",
+                 wall.object, wall.fog, wall.event, wall.boss_flag, GetCurrentPackedMap());
+    }
 }
 
 // ---- The Hunter's Dream together (2026-09-25) --------------------------------------------------
@@ -10300,6 +11155,21 @@ void NoteBbscBossRewardEvent(s64 event) {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_GUEST_ITEMS");
     if (!enabled || std::ranges::none_of(BbscBossRewards,
                                          [event](const auto& r) { return r.event == event; })) {
+        return;
+    }
+    // Same rule as the BlockClear2 skip: a guest that had no boss bar of its own did not fight
+    // (test 2026-10-20 00:12: event 12301800 reached the wait right after the guest followed the
+    // host into m23_00, 40 s before anyone fought there, and the guest got that boss's lot).
+    const s64 now = SteadyNowMs();
+    if (!BossFightActive() &&
+        (bbsc_boss_bar_seen_ms == 0 || now - bbsc_boss_bar_seen_ms > BbscBossClearFightMs)) {
+        static s64 skipped_event = -1;
+        if (skipped_event != event) {
+            skipped_event = event;
+            LOG_INFO(Debug, "BBSC boss drop: event {} reached its player-type wait on the guest "
+                            "without its own boss bar in the last {} s - no reward",
+                     event, BbscBossClearFightMs / 1'000);
+        }
         return;
     }
     std::scoped_lock lock{bbsc_boss_reward_mutex};
@@ -12208,6 +13078,10 @@ void TickBbscLifeBroadcast() {
     Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(&packet, sizeof(packet));
     if (dead != last_dead) {
         last_dead = dead;
+        bbsc_own_down = dead;
+        if (dead) {
+            bbsc_revivals_at_own_down = bbsc_peer_revivals.load();
+        }
         LOG_INFO(Debug, "BBSC life: told the others we are {} (session state {})",
                  dead ? "dead" : "alive", state);
     }
@@ -12803,6 +13677,62 @@ void TickBbscMessages() {
     }
 }
 
+// Texts the game's scripts (global_event.lua) show but its English text does not have: the game
+// shows its "?ActionEventInfo?" placeholder instead (test 2026-10-20, on the host: 01:30 and 10:02,
+// when the guest left). There is no table entry to point elsewhere, so the lookup itself is
+// redirected: its entry gets the id in ecx (category in edx), and the hook swaps the id for the
+// game's closest own line before the lookup runs (BbscMissingTexts). The callers try category 101
+// first and then 30, so only 30 is touched. Missing ids with no fitting line (sign deletion,
+// summon time-outs, OnReviveMagic) are left alone.
+constexpr u64 MsgLookupOffset = 0x00F6F340;
+// {missing id, shown instead}, script in global_event.lua
+constexpr std::array<std::pair<u32, u32>, 9> BbscMissingTexts{{
+    {20001020, 20000402}, // OnLeavePlayer: a player left -> "Cooperator <?leaveName?> returned ..."
+    {20000435, 20000402}, // LeaveMessage, the others (Parting Blank) -> the same line
+    {20000430, 20000403}, // LeaveMessage, the one leaving -> "Returning to own world."
+    {20000425, 20000400}, // OnKickOut -> "Sent cooperator <?leaveName?> back to their own world."
+    {20001005, 20001001}, // OnLanCutError -> "Exiting session due to unstable connection..."
+    {20001015, 20001001}, // OnP2PTimeOut -> the same
+    {20001003, 20001000}, // OnFailedCreateSession -> "Session lost."
+    {20001004, 20001000}, // OnFailedJoinSession -> the same
+    {20001010, 20001000}, // OnNpServerSignOut -> the same
+}};
+std::atomic<u32> bbsc_missing_text_logged{0}; // the last id logged, so each swap is logged once
+
+void PS4_SYSV_ABI BbscMsgLookupHook(u64, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || static_cast<u32>(registers->rdx) != 30) {
+        return;
+    }
+    const u32 id = static_cast<u32>(registers->rcx);
+    const auto found = std::ranges::find(BbscMissingTexts, id, &std::pair<u32, u32>::first);
+    if (found == BbscMissingTexts.end()) {
+        return;
+    }
+    const u32 to = found->second;
+    // The trampoline loads the registers back from the snapshot, so this changes the argument.
+    auto* changed = const_cast<GuestRegisterSnapshot*>(registers);
+    changed->rcx = (changed->rcx & ~0xFFFF'FFFFull) | to;
+    if (bbsc_missing_text_logged.exchange(id) != id) {
+        LOG_INFO(Debug, "BBSC messages: text 30/{} (not in the game's text) shown as 30/{}", id,
+                 to);
+    }
+}
+
+void InstallBbscLeaveTextHook() {
+    if (image_base == 0 || !BbscMessagesEnabled()) {
+        return;
+    }
+    // mov eax, esi ; mov rsi, [rdi+8]
+    static constexpr std::array<u8, 6> Entry{0x89, 0xF0, 0x48, 0x8B, 0x77, 0x08};
+    if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + MsgLookupOffset),
+                              std::span<const u8>{Entry}, 0, BbscMsgLookupHook)) {
+        LOG_ERROR(Debug, "BBSC messages: failed to hook the text lookup {:#x}", MsgLookupOffset);
+        return;
+    }
+    LOG_INFO(Debug, "BBSC messages: {} texts the game lacks are shown as its own closest lines",
+             BbscMissingTexts.size());
+}
+
 // ---- Boss battle line with the boss's name (2026-10-07) -----------------------------------------
 // The user: "the host started the final battle" should say which boss. The game's line for that
 // (30/105199, and 105299) is one fixed text with no boss tag. BBSC points it at its own text with the
@@ -12816,6 +13746,17 @@ constexpr s64 BbscHostBossFreshMs = 10'000;
 std::array<char16_t, 160> bbsc_boss_line_text{};
 std::atomic<s32> bbsc_host_boss_id{-1};
 std::atomic<s64> bbsc_host_boss_ms{0};
+
+// The host's boss bar, from its boss packets: up within the last within_ms.
+bool BbscHostBossBarRecent(s64 within_ms) {
+    return bbsc_host_boss_id.load() != -1 && SteadyNowMs() - bbsc_host_boss_ms.load() <= within_ms;
+}
+std::atomic<s64> bbsc_host_boss_fight_ms{0}; // last host packet with a boss on its bar
+
+bool BbscHostBossFightRecent(s64 within_ms) {
+    const s64 seen = bbsc_host_boss_fight_ms.load();
+    return seen != 0 && SteadyNowMs() - seen <= within_ms;
+}
 const char* BbscBossNameById(s32 id); // see "Discord status"
 
 // The name id on our own boss bar, or -1.
@@ -13356,6 +14297,14 @@ void TickBbscEchoTrace() {
     last = now;
 }
 
+// The host's wipe reload, asked for at a repeat death: the watchdog leaves the death alone until
+// the host is up again (or 60 s pass). In a session the reload took 25 s to start, and the game
+// revives the character only after the placement; meanwhile the watchdog raised YOU DIED and asked
+// for the reload again 3 times, and the game panicked (177) back to the title (2026-10-24 23:45,
+// Ludwig, the host with two guests).
+constexpr s64 BbscWipeReloadWaitMs = 60'000;
+s64 bbsc_wipe_reload_ms = 0;
+
 // Last resort: the player has been dead for 15 s and nothing revived them. Whatever step went
 // missing, they do not get to stay a corpse.
 void TickBbscDeadWatchdog() {
@@ -13371,6 +14320,17 @@ void TickBbscDeadWatchdog() {
     }
     const u64 player = GetLocalPlayerCharacter();
     const s32 hp = ReadablePointer(player, 0x3B8) ? GetCharacterHp(player) : -1;
+    if (bbsc_wipe_reload_ms != 0) {
+        if (hp > 0 || !session_alive || now - bbsc_wipe_reload_ms > BbscWipeReloadWaitMs) {
+            LOG_INFO(Debug, "BBSC death: done waiting for the wipe reload after {} ms ({})",
+                     now - bbsc_wipe_reload_ms,
+                     hp > 0 ? "up again" : !session_alive ? "session over" : "time limit");
+            bbsc_wipe_reload_ms = 0;
+        } else {
+            bbsc_dead_since_ms = 0;
+            return;
+        }
+    }
     // A held death during a boss fight is meant to stay dead until the boss is over.
     const bool spectating = bbsc_spectate_active && bbsc_death_mode == BbscDeathMode::Spectate;
     if (!session_alive || hp > 0 || hp < 0 || spectating || BbscCurtainActive()) {
@@ -13402,21 +14362,65 @@ void TickBbscDeadWatchdog() {
         return;
     }
     bbsc_dead_since_ms = 0;
-    if (repeat && BbscBossFightAtDeath() && LivingPartnerExists()) {
+    // A guest's repeat death with nobody left alive is a wipe: like the death step, it waits for
+    // the host's reload and then follows with a reload of its own (TickBbscSpectate). Respawning
+    // in place there kept the old load (test 2026-10-20 01:01, Vicar Amelia: the guest stayed in
+    // the fight with the boss bar and no enemies while the host's world had reloaded, and the
+    // host's copy of the guest was invisible).
+    const bool guest_waits_for_host = repeat && session_state == 6 && !LivingPartnerExists();
+    if (repeat && (guest_waits_for_host || (BbscBossFightAtDeath() && LivingPartnerExists()))) {
         // Same rule as the death step: in a boss fight the dead player waits for the boss kill or
         // for nobody to be left alive (TickBbscSpectate).
         bbsc_spectate_name = "repeat death";
         bbsc_spectate_since_ms = now;
+        bbsc_spectate_chr = player;
         bbsc_spectate_alone_since_ms = 0;
+        bbsc_spectate_logged_wait = false;
+        bbsc_spectate_saw_wipe = guest_waits_for_host;
+        bbsc_spectate_wipe_warped = false;
+        bbsc_spectate_host_back_ms = 0;
+        bbsc_spectate_revivals_at_death =
+            bbsc_own_down ? bbsc_revivals_at_own_down : bbsc_peer_revivals.load();
         bbsc_boss_cleared_since_ms = 0;
         bbsc_death_mode = BbscDeathMode::Spectate;
         bbsc_spectate_active = true;
-        LOG_INFO(Debug, "BBSC death: repeat death in a boss fight (session state {}) -> spectate "
-                        "until the boss dies or nobody is alive",
-                 session_state);
+        if (guest_waits_for_host) {
+            LOG_INFO(Debug, "BBSC death: repeat death with nobody alive (guest) -> wait for the "
+                            "host's reload, then follow it");
+        } else {
+            LOG_INFO(Debug, "BBSC death: repeat death in a boss fight (session state {}) -> "
+                            "spectate until the boss dies or nobody is alive",
+                     session_state);
+        }
         BBSC_TIMELINE("DEATH", "death: repeat death in a boss fight (session state {}) -> spectate "
                         "until the boss dies or nobody is alive",
                  session_state);
+        return;
+    }
+    // The host's repeat death with nobody left alive is a wipe: the guests wait for the host's
+    // reload and follow it, so the host must reload, not revive in place (2026-10-20 17:48: the
+    // guest died, the host died a second later, BBSC revived the host in place, and the guest sat
+    // dead waiting for a reload that never came until he left).
+    if (repeat && session_state == 3 && !LivingPartnerExists()) {
+        LOG_INFO(Debug, "BBSC death: repeat death of the host with nobody alive (a wipe) - the "
+                        "normal reload, so the guests can follow it");
+        bbsc_spectate_active = false;
+        BbscApplyDeathPenalty("wipe");
+        // A repeat death gets no death step, and the reload alone went where the last death step
+        // had pointed it, with the host still dead (2026-10-25 00:44: the host had rested at a new
+        // lamp since, the reload placed it at an old spot, it died again 5 s later, and the game's
+        // own death step then reloaded it at the new lamp - a double death). So the step runs
+        // here as the game runs it: SoloPlayDeath_2 (0x01381DE0, the Lua event object in rdi)
+        // picks the respawn point again and sets the load up as a death's, and
+        // BbscSpectateDeathHook asks for its reload (no living partner).
+        if (const u64 lua_event = BbscLuaEventObject(); lua_event != 0) {
+            using DeathStep = void PS4_SYSV_ABI (*)(u64 event_object);
+            reinterpret_cast<DeathStep>(image_base + SoloPlayDeathFinalOffset)(lua_event);
+            LOG_INFO(Debug, "BBSC death: the death step run for the host's repeat death");
+        } else {
+            RequestBbscDeathReload("host's repeat death in a wipe, no Lua event object");
+        }
+        bbsc_wipe_reload_ms = now;
         return;
     }
     if (repeat) {
@@ -14729,6 +15733,244 @@ bool BbscEraseLocalEffect(s32 id) {
     return BbscLocalEffectNode(id) == 0;
 }
 
+// A boss bar left on a guest's screen (2026-10-20 00:14, screenshot: Darkbeast Paarl's bar at a
+// lamp after the wipe follow). The death script that wipes the gauge (Failed_BossAreaMission,
+// 0x0138B302..0x0138B396) did not run for that load. Within BbscStaleBarAfterLoadMs of a load of the
+// guest's own character, a bar the host has not had for BbscStaleBarHostQuietMs (its packets say
+// -1) is wiped the same way. A guest that loads into a running fight is not a case that happens:
+// the fight's fog keeps it out.
+constexpr s64 BbscStaleBarAfterLoadMs = 60'000;
+constexpr s64 BbscStaleBarHostQuietMs = 3'000;
+void TickBbscStaleBossBar() {
+    static s64 last_ms = 0;
+    static u64 last_chr = 0;
+    static s64 loaded_ms = 0;
+    static s64 host_quiet_since_ms = 0;
+    // Only a bar that was there from the load on is a leftover. One that shows up after the load is
+    // a fight starting (2026-10-20 16:33: Darkbeast Paarl's bar was wiped 33 ms after it appeared,
+    // 38 s after the guest's load, because the host's packets still said "no boss"; the guest's
+    // deaths then counted as outside a boss fight).
+    static bool bar_since_load = false;
+    const s64 now = SteadyNowMs();
+    if (image_base == 0 || now - last_ms < 500) {
+        return;
+    }
+    last_ms = now;
+    const u64 chr = GetLocalPlayerCharacter();
+    if (chr != last_chr) {
+        last_chr = chr;
+        loaded_ms = now;
+        bar_since_load = chr != 0 && BbscGaugeBossId() != -1;
+    }
+    if (BbscGaugeBossId() == -1) {
+        bar_since_load = false; // gone once: whatever comes next is a new fight
+    }
+    if (!bar_since_load) {
+        host_quiet_since_ms = 0;
+        return;
+    }
+    if (GetSessionState() != 6 || chr == 0 || GetCharacterHp(chr) <= 0 ||
+        now - loaded_ms > BbscStaleBarAfterLoadMs) {
+        host_quiet_since_ms = 0;
+        return;
+    }
+    const bool host_fresh = now - bbsc_host_boss_ms.load() < BbscLifeFreshMs;
+    if (!host_fresh || bbsc_host_boss_id.load() != -1) {
+        host_quiet_since_ms = 0;
+        return;
+    }
+    if (host_quiet_since_ms == 0) {
+        host_quiet_since_ms = now;
+    }
+    const s32 own = BbscGaugeBossId();
+    if (own == -1 || now - host_quiet_since_ms < BbscStaleBarHostQuietMs) {
+        return;
+    }
+    const u64 gauge = ReadValue<u64>(image_base + BossGaugePointerOffset, 0);
+    if (!ReadablePointer(gauge, 0x1694) || !HasMemoryAccess(gauge + 0x1658, 0x3C, MemoryProt::CpuWrite)) {
+        return;
+    }
+    for (size_t slot = 0; slot < 3; ++slot) {
+        const size_t at = 0x1658 + slot * 0x14;
+        WriteValue<s32>(gauge, at, -1);
+        WriteValue<s32>(gauge, at + 4, -1);
+        WriteValue<s32>(gauge, at + 8, 0);
+        WriteValue<s32>(gauge, at + 0xC, 0);
+        WriteValue<u8>(gauge, at + 0x10, 0);
+    }
+    LOG_INFO(Debug, "BBSC boss bar: boss {} was still on the guest's bar {} ms after a load while "
+                    "the host has none - cleared",
+             own, now - loaded_ms);
+}
+
+// The X lock after a revive in place (2026-10-20, the guest's X did nothing after being revived
+// at a boss kill, 09:58 and 15:57). The state snapshot at 15:57:27, while X was locked, had every
+// lock BBSC knows about clear but SpEffect 2 on the guest (stateInfo 52, no duration), which the
+// game puts on a dead player and which a normal death's reload throws away. A revive in place has
+// no reload, so it stayed. It was absent whenever X worked (the Amelia kill at 01:03, the host). For
+// BbscDeathMarkWatchMs after a revive in place, a living local player carrying it has it taken off.
+// Timed effects still on the player at the revive (2026-10-20 17:47: the guest was revived poisoned
+// and went down again; 2026-10-21, the user: the host died of poison and came back with half its
+// life). A normal death's reload throws every timed effect away, so this does too, once, before
+// the HP refill. An effect node's game data is at +0x48: SpEffectParam, effectEndurance (float)
+// at +0x08 and stateInfo at +0x156 (as 0x018C6600 reads it). Taken off: every effect lasting 1 s
+// or more (poison and toxic last 30 s, and buffs and debuffs), and poison (2) and toxic (5) of any
+// length. Permanent ones (-1: equipment, runes, the world, and every SpEffect BBSC adds) and the
+// game's sub-second ones, which it re-adds each frame, stay.
+size_t BbscCureStatusAfterRevive(std::string* ids_out) {
+    const u64 player = GetLocalPlayerCharacter();
+    const u64 effects = ReadablePointer(player, 0x1D0) ? ReadValue<u64>(player, 0x1C8) : 0;
+    if (!ReadablePointer(effects, 0x10)) {
+        return 0;
+    }
+    std::vector<s32> ids;
+    u64 entry = ReadValue<u64>(effects, 0x08);
+    for (int guard = 0; entry != 0 && guard < 256 && ReadablePointer(entry, 0x60); ++guard) {
+        const u64 data = ReadValue<u64>(entry, 0x48);
+        if (ReadablePointer(data, 0x158)) {
+            const u16 state = ReadValue<u16>(data, 0x156);
+            const float endurance = ReadValue<float>(data, 0x08);
+            if (state == 2 || state == 5 || endurance >= 1.0f) {
+                ids.push_back(ReadValue<s32>(entry, 0x40));
+            }
+        }
+        entry = ReadValue<u64>(entry, 0x58);
+    }
+    size_t cured = 0;
+    for (const s32 id : ids) {
+        if (BbscEraseLocalEffect(id)) {
+            ++cured;
+            if (ids_out != nullptr) {
+                *ids_out += fmt::format("{}{}", ids_out->empty() ? "" : " ", id);
+            }
+        }
+    }
+    return cured;
+}
+
+constexpr s32 BbscDeathMarkEffectId = 2;
+constexpr s64 BbscDeathMarkWatchMs = 30'000;
+void TickBbscDeathMarkClear() {
+    static s64 last_ms = 0;
+    static s64 logged_for = 0;
+    const s64 now = SteadyNowMs();
+    if (bbsc_inplace_respawn_ms == 0 || image_base == 0 || now - last_ms < 500 ||
+        now - bbsc_inplace_respawn_ms > BbscDeathMarkWatchMs) {
+        return;
+    }
+    last_ms = now;
+    const u64 player = GetLocalPlayerCharacter();
+    if (player == 0 || GetCharacterHp(player) <= 0 ||
+        BbscLocalEffectNode(BbscDeathMarkEffectId) == 0) {
+        return;
+    }
+    const bool gone = BbscEraseLocalEffect(BbscDeathMarkEffectId);
+    if (logged_for != bbsc_inplace_respawn_ms) {
+        logged_for = bbsc_inplace_respawn_ms;
+        LOG_INFO(Debug, "BBSC revive: SpEffect {} (dead) was still on us {} ms after the revive - "
+                        "taken off ({})",
+                 BbscDeathMarkEffectId, now - bbsc_inplace_respawn_ms, gone ? "gone" : "STILL THERE");
+    }
+}
+
+// See BbscBossProbeMs: once a second after a real boss clear on the guest, which SpEffects it
+// carries and the control flags byte the state diffs showed changing (+0x40: 00 -> 08 at both kills
+// of 2026-10-19), and 4680 taken off if it is there.
+void TickBbscBossClearProbe() {
+    static s64 last_ms = 0;
+    const s64 now = SteadyNowMs();
+    if (bbsc_boss_probe_until_ms == 0 || image_base == 0 || now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    if (now > bbsc_boss_probe_until_ms) {
+        bbsc_boss_probe_until_ms = 0;
+        LOG_INFO(Debug, "BBSC boss probe: done");
+        return;
+    }
+    const u64 player = GetLocalPlayerCharacter();
+    if (player == 0) {
+        return;
+    }
+    std::string ids;
+    const u64 effects = ReadablePointer(player, 0x1D0) ? ReadValue<u64>(player, 0x1C8) : 0;
+    u64 entry = ReadablePointer(effects, 0x10) ? ReadValue<u64>(effects, 0x08) : 0;
+    for (int guard = 0; entry != 0 && guard < 64 && ReadablePointer(entry, 0x60); ++guard) {
+        ids += fmt::format("{}{}", ids.empty() ? "" : " ", ReadValue<s32>(entry, 0x40));
+        entry = ReadValue<u64>(entry, 0x58);
+    }
+    const u64 control = ReadValue<u64>(player, 0x58);
+    const u64 flags = ReadablePointer(control, 0x40) ? ReadValue<u64>(control, 0x38) : 0;
+    const int byte40 = ReadablePointer(flags, 0x48) ? ReadValue<u8>(flags, 0x40) : -1;
+    static std::string last_line;
+    const std::string line = fmt::format("SpEffects [{}], control flags +0x40 = {:#04x}", ids, byte40);
+    if (line != last_line) {
+        last_line = line;
+        LOG_INFO(Debug, "BBSC boss probe: {}", line);
+    }
+    // Integration note: the PR also took SpEffect 4680 off here; that was a guess ("the cause
+    // isn't known yet"), so the probe only logs its presence.
+    if (BbscLocalEffectNode(BbscBossClearEffectId) != 0) {
+        LOG_INFO(Debug, "BBSC boss probe: SpEffect {} is on the guest", BbscBossClearEffectId);
+    }
+}
+
+// A guest's copy invisible on the host after a wipe (2026-10-20 01:01: "reinsert v8: restarted 1
+// remote player insert task(s)", 2 in the world, but the guest was not drawn; also 2026-10-19 14:50,
+// only a transparent name at the boss entrance). TickBbscRemoteRevive only handles a copy that still
+// carries the death flag; a re-inserted copy has none. For BbscReinsertWatchMs after a re-insert,
+// a living remote co-op copy with opacity (chr+0x208) at 0 or drawing off gets the same visibility
+// steps as that revive, once, and it is logged.
+constexpr s64 BbscReinsertWatchMs = 30'000;
+void TickBbscReinsertVisible() {
+    static s64 last_ms = 0;
+    static std::vector<u64> fixed;
+    const s64 now = SteadyNowMs();
+    if (bbsc_reinsert_ms == 0 || image_base == 0 || now - last_ms < 500) {
+        return;
+    }
+    last_ms = now;
+    if (now - bbsc_reinsert_ms > BbscReinsertWatchMs) {
+        bbsc_reinsert_ms = 0;
+        fixed.clear();
+        return;
+    }
+    const u64 world_chr = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+    if (!ReadablePointer(world_chr, 0x70)) {
+        return;
+    }
+    const u64 local = ReadValue<u64>(world_chr, 0x60);
+    const s32 count = ReadValue<s32>(world_chr, 0x30);
+    const u64 entries = ReadValue<u64>(world_chr, 0x38);
+    if (count <= 0 || count > 64 || !ReadablePointer(entries, static_cast<size_t>(count) * 0x38)) {
+        return;
+    }
+    for (s32 i = 0; i < count; ++i) {
+        const u64 chr = ReadValue<u64>(entries, static_cast<size_t>(i) * 0x38);
+        if (chr == 0 || chr == local || !ReadablePointer(chr, 0x410) ||
+            GetCharacterType(chr) != 1 || GetCharacterHp(chr) <= 0 ||
+            std::ranges::find(fixed, chr) != fixed.end()) {
+            continue;
+        }
+        const u64 modules = ReadValue<u64>(chr, 0x3B0);
+        const u64 draw = ReadablePointer(modules, 0x60) ? ReadValue<u64>(modules, 0x58) : 0;
+        const u64 draw_state = ReadablePointer(draw, 0x30) ? ReadValue<u64>(draw, 0x28) : 0;
+        const float opacity = ReadValue<float>(chr, 0x208);
+        const int drawing = ReadablePointer(draw_state, 0x10) ? ReadValue<u8>(draw_state, 0x0C) : -1;
+        if (opacity > 0.01f && drawing != 0) {
+            continue;
+        }
+        fixed.push_back(chr);
+        WriteValue<u64>(chr, 0x208, 0x3F8000003F800000ull);
+        if (drawing == 0) {
+            WriteValue<u8>(draw_state, 0x0C, 1);
+        }
+        LOG_INFO(Debug, "BBSC reinsert visible: the re-inserted guest was not drawn (opacity {:.2f}, "
+                        "drawing {}) {} ms after the re-insert - made visible",
+                 opacity, drawing, now - bbsc_reinsert_ms);
+    }
+}
+
 // Test 2026-10-05 14:42: with 9020 on both players, the host world found the invader's sign
 // (SummonType 2), claimed it, opened its room and signalled the invader - who never joined
 // (no JoinSession_Black). The invader carried 9020 too. HYPOTHESIS: a player whose own world is
@@ -14943,6 +16185,67 @@ void TickBbscGuestBlank() {
         return;
     }
     // As 0x018FF74D..0x018FF759: the Lua event by name, then every remote slot marked as leaving.
+    using LuaEvent = void PS4_SYSV_ABI (*)(u64 lua, u64 name);
+    using MarkSlotsLeaving = void PS4_SYSV_ABI (*)();
+    reinterpret_cast<LuaEvent>(image_base + 0x01339870)(lua, image_base + 0x0492EA75);
+    reinterpret_cast<MarkSlotsLeaving>(image_base + 0x014EB860)();
+}
+
+// The host quit the game (2026-10-21, the user: "when host exit game and have a session, it should
+// kill session"). The kept-session patches keep the guest's room alive, so the guest stayed in a
+// world with no host. The host sends its position every second while hosting (TickBbscFollow-
+// Broadcast) and only goes quiet during its own loads. A living guest that has heard nothing from
+// its host for BbscHostGoneMs leaves the way a Parting Blank does (OnLeaveMagic, as
+// TickBbscGuestBlank) and goes home. A crash on the host's side ends the same way.
+// Integration: 90 s rather than 45 s - the host is silent through every load of its own
+// (TickBbscFollowBroadcast returns while global+0x08 is set), and a host death plus a long
+// reload came close to 45 s.
+constexpr s64 BbscHostGoneMs = 90'000;
+
+void TickBbscHostGone() {
+    static s64 left_ms = 0;
+    static s64 guest_since_ms = 0; // when this guest session (state 6) began
+    const s64 now = SteadyNowMs();
+    if (image_base == 0 || GetSessionState() != 6 || GetLocalPlayerType() != 1 ||
+        !BbscWarpTogetherEnabled()) {
+        left_ms = 0;
+        guest_since_ms = 0;
+        return;
+    }
+    if (guest_since_ms == 0) {
+        guest_since_ms = now;
+    }
+    s64 heard_ms = 0;
+    {
+        std::scoped_lock lock{bbsc_follow_mutex};
+        heard_ms = bbsc_follow_latest.received_ms;
+    }
+    // Integration: bbsc_follow_latest is never reset between sessions, so a packet from an earlier
+    // host must not count - only one received in this session, and only once the session itself is
+    // older than the timeout.
+    if (heard_ms == 0 || heard_ms < guest_since_ms || now - guest_since_ms < BbscHostGoneMs ||
+        now - heard_ms < BbscHostGoneMs) {
+        return; // never heard from this host (older build?), or it is still there
+    }
+    if (RemotePlayerCount() != 0) {
+        return; // the host's copy is still in the world: silent, but not gone
+    }
+    if (left_ms != 0 && now - left_ms < 15'000) {
+        return; // asked already, the leave is under way
+    }
+    const u64 global = GetGlobalState();
+    const u64 player = GetLocalPlayerCharacter();
+    const u64 lua_holder = ReadValue<u64>(image_base + 0x0553B0C8, 0);
+    const u64 lua = ReadablePointer(lua_holder, 0x10) ? ReadValue<u64>(lua_holder, 8) : 0;
+    if (lua == 0 || !ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0 ||
+        player == 0 || GetCharacterHp(player) <= 0) {
+        return; // loading or dead: the death and wipe logic first, then this
+    }
+    left_ms = now;
+    LOG_WARNING(Debug, "BBSC leave: nothing from the host for {} s (it quit or lost its game) - the "
+                       "co-op ends, BBSC raises OnLeaveMagic",
+                (now - heard_ms) / 1000);
+    BbscAnnounce(u"The host has left.\nReturning to your own world.", "host gone");
     using LuaEvent = void PS4_SYSV_ABI (*)(u64 lua, u64 name);
     using MarkSlotsLeaving = void PS4_SYSV_ABI (*)();
     reinterpret_cast<LuaEvent>(image_base + 0x01339870)(lua, image_base + 0x0492EA75);
@@ -16076,12 +17379,21 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscSessionEnd();
         TickBbscStrayForcedWarp();
         TickBbscGuestBlank();
+        TickBbscDeathSpot();
+        TickBbscHostGone();
         TickBbscDeadWatchdog();
         TickBbscDeathCurtain();
         TickBbscLoadingScreenClose();
+        TickBbscLampGuard();
         TickBbscStageWatch();
         TickBbscHostDeathNotice();
         TickBbscBossUnlock();
+        TickBbscBossLeaveMark();
+        TickBbscWipeEchoes();
+        TickBbscStaleBossBar();
+        TickBbscBossClearProbe();
+        TickBbscReinsertVisible();
+        TickBbscBossExitWalls();
         CaptureBbscGuestLoot();
         TickBbscGuestLootReset();
         TickBbscDreamStateRestore();
@@ -16097,6 +17409,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         if (BbscSpectateEnabled()) {
             TickBbscRemoteRevive();
             TickBbscDeathLockClear();
+            TickBbscDeathMarkClear();
             TickBbscStateDiff();
             TickBbscJoinTeleport();
         }
@@ -16104,6 +17417,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         if (BbscRejoinEnabled()) {
             TrackBbscSignType();
             TickBbscReinsertV8();
+            TickBbscHomeTypeRepair();
             TickBbscSelfHeal();
             static s64 last_shape_ms = 0;
             if (const s64 now = SteadyNowMs(); now - last_shape_ms > 1'000) {
@@ -16745,9 +18059,19 @@ bool BbscConnectFirstPlacementFresh() {
 
 } // namespace
 
+void OnBbscStainPacket(std::uint8_t kind, std::uint32_t stain) {
+    std::scoped_lock lock{bbsc_stain_mutex};
+    if (bbsc_stain_events.size() < 32) {
+        bbsc_stain_events.emplace_back(kind, stain);
+    }
+}
+
 void OnBbscHostBossPacket(std::int32_t boss) {
     bbsc_host_boss_id = boss;
     bbsc_host_boss_ms = SteadyNowMs();
+    if (boss != -1) {
+        bbsc_host_boss_fight_ms = bbsc_host_boss_ms.load();
+    }
 }
 
 void OnBbscProgressPacket(const std::uint32_t* flags, std::size_t count) {
@@ -17812,6 +19136,7 @@ void InstallReverseEngineeringTrace() {
     InstallBbscQuitHook();
     InstallBbscDeathTraceHooks();
     InstallBbscBannerHook();
+    InstallBbscLeaveTextHook();
 }
 
 BbscPresence GetBbscPresence() {
