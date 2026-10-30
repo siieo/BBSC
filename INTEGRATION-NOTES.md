@@ -56,6 +56,27 @@ Two integration-only edits:
 - Every added line of every applied PR was checked to be present in the merged tree (except the
   three deliberately dropped probe lines of #14).
 
+## Building for BBport
+
+On BBport all of BBSC runs in the mod DLL: `bbsc-launch.exe` stands in for `bb-probe.exe`, starts
+it suspended and injects `bbsc.dll` (see `emulator/mod/bbsc_launch.cpp`). None of the applied PRs
+touch `bbport/` (the BBport source patch), so `bb-probe.exe` from the BBSC 0.0.2 BBport package
+stays as it is - only `bbsc.dll` has to be rebuilt.
+
+- On a Windows PC: Visual Studio 2022 (any edition or Build Tools) with "Desktop development with
+  C++" and "C++ Clang tools for Windows", then from the repository folder
+  `git submodule update --init --depth 1 emulator/externals/fmt emulator/externals/xbyak` (not
+  needed with the zip that already carries them) and `emulator\mod\build-mod.cmd`.
+  Output: `build\mod\bbsc.dll` (or `%BBSC_OUT%`, or `D:\BBSC\build\mod` when `D:\BBSC` exists).
+- On GitHub: push this tree to a repository of yours, Actions -> "Build BBSC mod" -> Run workflow,
+  download the `bbsc-mod` artifact (`.github/workflows/build-mod.yml`).
+- Install: put the new `bbsc.dll` over the old one in the BBport package (the folder holding
+  `bbsc-launch.exe`). Back it up first.
+
+`build-mod.cmd` was changed for this: Visual Studio is found with vswhere (any edition, not only
+Community), clear messages when clang-cl or the submodules are missing, and the output folder no
+longer has to be `D:\BBSC`. The compile and link lines are unchanged.
+
 ## Things to test first
 
 1. Kin Bell in the Hunter's Dream after #19 (the bell now takes the vanilla Small Resonant branch).
@@ -67,6 +88,8 @@ Two integration-only edits:
 
 ```
 INTEGRATION-NOTES.md                 (new)
+.github/workflows/build-mod.yml      (new - Windows build of bbsc.dll)
+emulator/mod/build-mod.cmd           (portable: vswhere, output folder)
 docs/CHANGELOG.md                    (entry added)
 emulator/mod/bbsc_http.cpp           (#13)
 emulator/mod/bbsc_mod.cpp            (#29)
